@@ -9,7 +9,7 @@
 
 ### docker run 命令：
 
-<img src="./Docker.assets/image-20241014164339570.png" alt="image-20241014164339570" style="zoom:67%;" />
+<img src="./docker.assets/image-20241014164339570.png" alt="image-20241014164339570" style="zoom:67%;" />
 
 #### 选项详解：
 
@@ -25,7 +25,7 @@
 
 ### 基础命令：
 
-![image-20241014192823646](./Docker.assets/image-20241014192823646.png)
+![image-20241014192823646](./docker.assets/image-20241014192823646.png)
 
 官方文档：[Docker 命令官方文档](https://docs.docker.com/reference/cli/docker/)
 
@@ -68,7 +68,7 @@ docker load -i nginx.tar
 
 ​		**数据卷（volume）**是虚拟目录，是**容器内目录**与**宿主机目录**之间映射的桥梁，建立数据卷即可利用宿主机中的高级（Linux）命令同步修改容器目录中的对应文件以及部署静态资源
 
-<img src="./Docker.assets/image-20241014213631862.png" alt="image-20241014213631862" style="zoom:67%;" />
+<img src="./docker.assets/image-20241014213631862.png" alt="image-20241014213631862" style="zoom:67%;" />
 
 |           命令           | 功能 | 文档地址 |
 | :----------------------: | :--: | :------: |
@@ -90,7 +90,7 @@ docker load -i nginx.tar
 docker run -d --name nginx -p 80:80 -v html:/usr/share/nginx/html nginx
 ```
 
-<img src="./Docker.assets/image-20241014222910944.png" alt="image-20241014222910944" style="zoom: 50%;" />
+<img src="./docker.assets/image-20241014222910944.png" alt="image-20241014222910944" style="zoom: 50%;" />
 
 #### 案例2-MySQL容器数据挂载：
 
@@ -114,11 +114,11 @@ docker run -v ./mysql:/var/lib/mysql 将指定挂载路径为当前目录下的m
 
 ​		构建镜像的过程其实就是把应用程序、程序运行的系统函数库、运行配置等文件包打包的过程
 
-<img src="./Docker.assets/image-20241015004417390.png" alt="image-20241015004417390" style="zoom: 80%;" />
+<img src="./docker.assets/image-20241015004417390.png" alt="image-20241015004417390" style="zoom: 80%;" />
 
 ​		将镜像分层打包便于组装与重构，提升代码的复用性，但是手动自定义镜像需要查询大量资料、打包各种压缩包，步骤较为繁琐，因此使用 Dockerfile 可以帮助构建镜像
 
-<img src="./Docker.assets/image-20241015004613073.png" alt="image-20241015004613073" style="zoom:67%;" />
+<img src="./docker.assets/image-20241015004613073.png" alt="image-20241015004613073" style="zoom:67%;" />
 
 #### Dockerfile：
 
@@ -193,7 +193,7 @@ docker logs -f java_11.0
 
 ​		默认情况下，所有容器都是以Bridge方式的连接到Docker的虚拟网桥上，但是Docker的虚拟地址可能会随宿主机的关闭启动而修改，为此可以使用自定义网络来更加方便地访问服务器：
 
-<img src="./Docker.assets/image-20241015105818456.png" alt="image-20241015105818456" style="zoom: 80%;" />
+<img src="./docker.assets/image-20241015105818456.png" alt="image-20241015105818456" style="zoom: 80%;" />
 
 ​		加入自定义网络的容器还可以通过容器名互相访问，Docker的网络操作命令如下：
 
@@ -227,7 +227,7 @@ ping 容器 (容器需先加入tassel网桥)
 
 ​		Docker Compose通过单独的 **docker-compose.yml** 模板文件（YAML 格式）来定义相关联的应用容器，帮助我们实现**相互关联的Docker容器的快速部署**
 
-<img src="./Docker.assets/image-20241015115622471.png" alt="image-20241015115622471" style="zoom:67%;" />
+<img src="./docker.assets/image-20241015115622471.png" alt="image-20241015115622471" style="zoom:67%;" />
 
 > ```apl
 > # 命令格式
