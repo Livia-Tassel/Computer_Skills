@@ -22,6 +22,7 @@
 </table>
 
 从简化流程中可以看出 $Transform$ 架构被分为两个独立的部分，即编码器与解码器。
+[Transfrom Illustrated](https://jalammar.github.io/illustrated-transformer/)
 
 ### 分词
 ![alt text](llm.assets/4.png)
