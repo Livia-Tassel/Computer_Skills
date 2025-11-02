@@ -1,11 +1,13 @@
+<h1 style="font-family: '仿宋', 'FangSong', 'Times New Roman', serif; color: orange; font-size: 2em; font-weight: bold; text-align: center; border-bottom: none; margin-bottom: 0;">Docker 入门</h1>
+<p style="font-family: 'Times New Roman', serif; font-size: 1em; text-align: right; margin-top: 0;">Livia Tassel</p>
+<div style="font-family: 'Times New Roman', 'FangSong', '仿宋', serif;">
+
 [TOC]
 
 ## 快速入门：
-
 ### 镜像与容器：
-
-​		当利用Docker安装应用时，Docker会自动搜索并下载应用**镜像（image）**。镜像不仅包含应用本身，还包含应用运行所需要的**环境、配置、系统函数库**。Docker会在运行镜像时创建一个隔离环境，称为**容器（container）**。
-​		镜像仓库：存储和管理镜像的平台，Docker官方维护的公共仓库：[Docker Hub](https://hub.docker.com/)
+​当利用Docker安装应用时，Docker会自动搜索并下载应用**镜像（image）**。镜像不仅包含应用本身，还包含应用运行所需要的**环境、配置、系统函数库**。Docker会在运行镜像时创建一个隔离环境，称为**容器（container）**。
+​镜像仓库：存储和管理镜像的平台，Docker官方维护的公共仓库：[Docker Hub](https://hub.docker.com/)。
 
 ### docker run 命令：
 
@@ -21,16 +23,12 @@
 |      -p 宿主机端口：容器内端口      | 宿主机端口映射到容器内端口 |   -p 80：80 \   |
 | Repository（镜像名）：TAG（版本号） |        镜像名称结构        |      nginx      |
 
-## Docker基础：
-
+## Docker 基础：
 ### 基础命令：
-
 ![image-20241014192823646](./docker.assets/image-20241014192823646.png)
-
 官方文档：[Docker 命令官方文档](https://docs.docker.com/reference/cli/docker/)
 
 ### 演示：
-
 ```apl
 # 拉取Nginx镜像,创建并运行Nginx容器
 1.在DockerHub中搜索Nginx镜像,查看镜像的名称
@@ -65,8 +63,7 @@ docker load -i nginx.tar
 ```
 
 ### 数据卷：
-
-​		**数据卷（volume）**是虚拟目录，是**容器内目录**与**宿主机目录**之间映射的桥梁，建立数据卷即可利用宿主机中的高级（Linux）命令同步修改容器目录中的对应文件以及部署静态资源
+**数据卷（volume）**是虚拟目录，是**容器内目录**与**宿主机目录**之间映射的桥梁，建立数据卷即可利用宿主机中的高级（Linux）命令同步修改容器目录中的对应文件以及部署静态资源
 
 <img src="./docker.assets/image-20241014213631862.png" alt="image-20241014213631862" style="zoom:67%;" />
 
@@ -78,8 +75,7 @@ docker load -i nginx.tar
 |  docker volume inspect   | 查看某个数据卷的详情 | [docker   volume inspect](https://docs.docker.com/engine/reference/commandline/volume_inspect/) |
 |   docker volume prune    | 清除数据卷 | [docker   volume prune](https://docs.docker.com/engine/reference/commandline/volume_prune/) |
 
-#### 案例1-利用Nginx容器部署静态资源：
-
+#### 案例 1-利用 Nginx 容器部署静态资源：
 > 创建Nginx容器，修改Nginx容器内的 html目录 下的 index.html文件，查看变化
 > 将静态资源部署到Nginx的 html目录
 
@@ -92,10 +88,9 @@ docker run -d --name nginx -p 80:80 -v html:/usr/share/nginx/html nginx
 
 <img src="./docker.assets/image-20241014222910944.png" alt="image-20241014222910944" style="zoom: 50%;" />
 
-#### 案例2-MySQL容器数据挂载：
-
-> •查看MySQL容器自带数据卷挂载
-> •基于宿主机目录实现MySQL数据目录、配置文件、初始化脚本的挂载（查阅官方镜像文档）
+#### 案例 2-MySQL 容器数据挂载：
+> • 查看MySQL容器自带数据卷挂载
+> • 基于宿主机目录实现MySQL数据目录、配置文件、初始化脚本的挂载（查阅官方镜像文档）
 > 	①挂载 /root/mysql/data 到容器内的 /var/lib/mysql目录
 > 	②挂载 /root/mysql/conf 到容器内的 /etc/mysql/conf.d目录（携带配置文件）
 > 	③挂载 /root/mysql/init 到容器内的 /docker-entrypoint-initdb.d目录（携带SQL脚本）
@@ -109,20 +104,16 @@ docker run -v ./mysql:/var/lib/mysql 将指定挂载路径为当前目录下的m
 ```
 
 ### 自定义镜像：
-
 #### 简介：
-
-​		构建镜像的过程其实就是把应用程序、程序运行的系统函数库、运行配置等文件包打包的过程
+构建镜像的过程其实就是把应用程序、程序运行的系统函数库、运行配置等文件包打包的过程
 
 <img src="./docker.assets/image-20241015004417390.png" alt="image-20241015004417390" style="zoom: 80%;" />
-
-​		将镜像分层打包便于组装与重构，提升代码的复用性，但是手动自定义镜像需要查询大量资料、打包各种压缩包，步骤较为繁琐，因此使用 Dockerfile 可以帮助构建镜像
+将镜像分层打包便于组装与重构，提升代码的复用性，但是手动自定义镜像需要查询大量资料、打包各种压缩包，步骤较为繁琐，因此使用 Dockerfile 可以帮助构建镜像
 
 <img src="./docker.assets/image-20241015004613073.png" alt="image-20241015004613073" style="zoom:67%;" />
 
 #### Dockerfile：
-
-​		**Dockerfile**本质上为文本文件，其中包含众多**指令(Instruction)**，用指令来说明要执行的操作来构建镜像。将来Docker可以根据Dockerfile协助构建镜像
+**Dockerfile**本质上为文本文件，其中包含众多**指令(Instruction)**，用指令来说明要执行的操作来构建镜像。将来Docker可以根据Dockerfile协助构建镜像
 
 |    指令    |                 功能                  |                             示例                             |
 | :--------: | :-----------------------------------: | :----------------------------------------------------------: |
@@ -162,8 +153,7 @@ ENTRYPOINT ["java", "-jar", "/app.jar"]
 ```
 
 #### 镜像构建：
-
-​		Dockerfile文件编写完成后，利用 build命令 构建镜像
+Dockerfile文件编写完成后，利用 build命令 构建镜像
 
 ```apl
 # build ———— 构建镜像
@@ -190,12 +180,10 @@ docker logs -f java_11.0
 ```
 
 ### 网络：
-
-​		默认情况下，所有容器都是以Bridge方式的连接到Docker的虚拟网桥上，但是Docker的虚拟地址可能会随宿主机的关闭启动而修改，为此可以使用自定义网络来更加方便地访问服务器：
-
+默认情况下，所有容器都是以Bridge方式的连接到Docker的虚拟网桥上，但是Docker的虚拟地址可能会随宿主机的关闭启动而修改，为此可以使用自定义网络来更加方便地访问服务器：
 <img src="./docker.assets/image-20241015105818456.png" alt="image-20241015105818456" style="zoom: 80%;" />
 
-​		加入自定义网络的容器还可以通过容器名互相访问，Docker的网络操作命令如下：
+​加入自定义网络的容器还可以通过容器名互相访问，Docker的网络操作命令如下：
 
 |           指令            |           功能           |                           文档地址                           |
 | :-----------------------: | :----------------------: | :----------------------------------------------------------: |
@@ -222,10 +210,8 @@ ping 容器 (容器需先加入tassel网桥)
 ```
 
 ## 项目部署：
-
 ### DockerCompose：
-
-​		Docker Compose通过单独的 **docker-compose.yml** 模板文件（YAML 格式）来定义相关联的应用容器，帮助我们实现**相互关联的Docker容器的快速部署**
+Docker Compose通过单独的 **docker-compose.yml** 模板文件（YAML 格式）来定义相关联的应用容器，帮助我们实现**相互关联的Docker容器的快速部署**
 
 <img src="./docker.assets/image-20241015115622471.png" alt="image-20241015115622471" style="zoom:67%;" />
 
