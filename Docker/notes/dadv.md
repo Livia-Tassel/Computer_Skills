@@ -62,3 +62,28 @@ sudo docker version
 # 磁盘映射
 将容器内部的磁盘映射到本地，此时删除容器，磁盘中的文件依旧会在本地保留。
 ![alt text](dadv.assets/2.png)
+
+# 自定义镜像
+基于现有的 Ubuntu 镜像自定义镜像：
+```Dockerfile
+FROM Ubuntu
+RUN apt-get update
+RUN apt-get install python
+RUN pip install flask
+RUN pip install flask-mysql
+COPY./opt/source-code
+ENTRYPoINT FLASK_APP=/opt/source-code/app.py flask run
+```
+
+执行创建命令，并推送到 Docker Hub 仓库：
+```bash
+docker build Dockerfile -t livia/custom-ubuntu
+docker push livia/custom-ubuntu
+```
+
+![alt text](dadv.assets/3.png)
+>**自上而下**
+ Base Image（基础镜像）：以现有镜像为基础创建自定义镜像。
+ Install Dependencies（依赖）：在基础镜像内部执行命令，以搭建基础环境。
+ Copy Code（复制源码）：将 Dockerfile 所在目录下所有文件复制到镜像内部的新目录 /opt/source-code 中，通常是测试代码。
+ Sepcify Entrypoint（指定入口）：指定容器从该镜像启动时，默认执行的命令。
