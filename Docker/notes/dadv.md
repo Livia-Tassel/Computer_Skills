@@ -77,6 +77,7 @@ ENTRYPoINT FLASK_APP=/opt/source-code/app.py flask run
 
 执行创建命令，并推送到 Docker Hub 仓库：
 ```bash
+docker login
 docker build Dockerfile -t livia/custom-ubuntu
 docker push livia/custom-ubuntu
 ```
@@ -87,3 +88,74 @@ docker push livia/custom-ubuntu
  Install Dependencies（依赖）：在基础镜像内部执行命令，以搭建基础环境。
  Copy Code（复制源码）：将 Dockerfile 所在目录下所有文件复制到镜像内部的新目录 /opt/source-code 中，通常是测试代码。
  Sepcify Entrypoint（指定入口）：指定容器从该镜像启动时，默认执行的命令。
+
+ ## CMD
+CMD 和 ENTRYPOINT 在 Dockerfile 中都是“容器启动时要执行的命令”，但它们的**核心区别**在于：「主命令」、「默认参数」，以及在 `docker run` 时能否覆盖。
+
+### 🐳
+
+| 特性 | CMD | ENTRYPOINT |
+|:----:| :----: | :-----------: |
+| 定义位置 | Dockerfile 中只能有一个 CMD（后写的覆盖前写的） | Dockerfile 中只能有一个 ENTRYPOINT |
+| 作用 | 为容器提供**默认命令或参数** | 定义容器**固定要执行的主命令** |
+| 能否被 `docker run` 覆盖 | ✅ 会 | ⚙️ 不会 |
+| 常见用法 | 提供可变参数 | 定义不可变的主执行命令 |
+
+### 只有 CMD 的情况
+```Dockerfile
+FROM ubuntu
+CMD ["sleep", "5"]
+```
+
+执行：
+```bash
+docker run myimage
+```
+👉 默认执行 `sleep 5`。
+
+覆盖默认命令：
+```bash
+docker run myimage echo "hello"
+```
+👉 执行 `echo "hello"`（`sleep 5` 被覆盖）。
+
+### 只有 ENTRYPOINT 的情况
+```Dockerfile
+FROM ubuntu
+ENTRYPOINT ["sleep"]
+```
+
+执行：
+```bash
+docker run myimage 5
+```
+👉 实际执行的是 `sleep 5`。
+
+不加参数：
+```bash
+docker run myimage
+```
+👉 报错：`sleep: missing operand`，因为 ENTRYPOINT 不会自动附带参数。
+
+### ENTRYPOINT + CMD 组合
+```Dockerfile
+FROM ubuntu
+ENTRYPOINT ["sleep"]
+CMD ["5"]
+```
+
+执行：
+```bash
+docker run myimage
+```
+👉 默认执行 `sleep 5`
+
+执行：
+```bash
+docker run myimage 10
+```
+👉 执行 `sleep 10`。
+
+# 环境变量
+通常在 Docker 中会有一些环境值占位符可以用 `-e` 指明，若不指明则为默认值。
+![alt text](dadv.assets/4.png)
