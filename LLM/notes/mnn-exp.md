@@ -120,6 +120,7 @@ make install
 │   ├── build_linux/                         # MNNT 编译目录
 │   │   └── llm_precision_test               # 可执行文件
 │   ├── llm_precision.cpp                    # 测试代码
+│   ├── CMakeList.txt
 │   └── datasets                             # 测试集 
 │ 
 |
@@ -127,6 +128,12 @@ make install
     └── build_linux/
         └── src/
             └── libsentencepiece.a / libsentencepiece.so
+```
+同样地，为 SentencePiece 编译库文件：
+```bash
+cd /home10T/ljq/sentencepiece/build_linux
+cmake ..
+make -j16
 ```
 
 然后就可以 MNNT 目录下编写测试代码（llm_precision.cpp），测试代码中调用 MNN 模型接口进行推理，以下是以 `WMT14 EN→DE` 测试集为例编写的测试代码示例：
@@ -268,7 +275,15 @@ message(STATUS "CMake configuration done. Run 'make' to build.")
 ```
 ※ 切记将以上文件中的 `/home10T/ljq/` 改为实际路径！！！
 
-至此，MNNT 目录下应该至少有 llm_precision.cpp（测试文件），mmlu_test.csv（测试集）以及 CMakeList.txt 三个文件。最后，执行测试脚本完成测试：
+至此，MNNT 目录下应该至少有 llm_precision.cpp（测试文件），mmlu_test.csv（测试集）以及 CMakeList.txt 三个文件。然后，来到 `MNNT/build_linux` 目录下完成编译，得到可执行文件 llm_precision_test：
+```bash
+cd /home10T/ljq/MNNT/build_linux
+cmake .. 
+make -j16
+ls -l llm_precision_test
+```
+
+最后，执行可执行文件完成测试：
 ```bash
 cd ./MNNT/build_linux
 ./llm_precision_test /path/to/llama2_mnn/config.json \
