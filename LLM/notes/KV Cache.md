@@ -64,25 +64,73 @@ r_w = \frac{\alpha}{\sqrt{m_t}} \times \text{median}(W) = \frac{5e-5}{0.02} \tim
 ## 名词解释
 - 张量（Tensor）：高维向量，CacheGen 核心在于通过编码技术，将大张量转化为小的 “比特流”，传输后再解码恢复为张量。
 - Delta 编码（Delta Coding）：即残差编码，使得量化和算术编码压缩效率更高。
-- 自适应流传输（Adaptive Streaming）：根据带宽动态适应传输内容，在 CacheGen 中将上下文拆分为多个上下文块，每个块都生成不同精度的版本，传输时根据实时带宽选择最合适版本。
 - 通道（Channel）：即不同 K/V 向量的同一位置，由于相邻 token 语义的相似性，相邻向量同一通道的值也具有相似性，[详细](https://www.zhihu.com/question/362131975/answer/3491521854)见解。
-
-![alt text](kvcache.assets/2.png)
-## 原理解析
-**token 级局部性（Token-wise Locality）：** 同一层的同一通道内，相邻 token 的 KV 值差异远小于原始值，即**差值（delta）的方差比原始值的方差低**。
-
-**层间损失敏感性（Layer-wise Sensitivity to Loss）:** 浅层 KV 抽象的是原始信息，其值损失对 LLM 性能影响较大，而深层较小。
-
-**维度分布差异（Distribution along Layers, Channels, and Tokens）：** 由于语义的相似性，同层/通道的 KV 值分布更集中，为此按 “层+通道” 分组的 KV 值信息增益（熵降低）远高于按 token 位置分组。
 
 ## 核心方法
 ### 差值张量计算（Delta Tensors）
-- 操作：将上下文按 10 个 token 分组，每组选首个 token 为 “锚定 token”，高精度存储，其余 token 计算与锚定 token 的 KV 差值（即 delta 张量）。
+- **操作**：将上下文按 10 个 token 分组，每组选首个 token 为 “锚定 token”，以高精度存储，其余 token 以低精度存储与锚定 token 的 KV 差值（即 delta 张量）。
+- **原理**：**token 级局部性（Token-wise Locality）**，即同一层的同一通道内，相邻 token 的 KV 值差异远小于原始值，即**差值（delta）的方差比原始值的方差低**。
+![alt text](kvcache.assets/4.png)
 
 ### 分层量化（Layer-wise Quantization）
-- 操作：将 Transformer 层分为 3 组（前 1/3、中 1/3、后 1/3），对不同组应用不同精度的**向量量化**，从前到后精度依次下降。
+- **操作**：将 Transformer 分为 3 组（前 1/3、中 1/3、后 1/3），对不同组采用不同精度的**向量量化**，从前到后精度依次下降。
+- **原理**：**层间损失敏感性（Layer-wise Sensitivity to Loss）**,即浅表 KV 抽象的是原始信息，其值损失对 LLM 性能影响较大。
+![alt text](kvcache.assets/5.png)
 
 ### 算术编码（Arithmetic Coding）
-- 操作：离线为每个 “层+通道” 组合量化符号的概率分布，使用 GPU 加速的算术编码库，对量化后的 delta 张量和锚定张量进行**无损压缩**。
+- **操作**：离线为所有 “Layer+Channel” 组合量化符号的概率分布，使用 GPU 加速的算术编码库，对量化后的 delta 张量和锚定张量进行**无损压缩**。
+- **原理**：**维度分布差异（Distribution along Layers, Channels, and Tokens）**，即由于语义的相似性，同通道的 KV 值分布更集中，为此按 “Layer+Channel” 分组的 KV 值信息增益（熵降低）远高于按 token 位置分组。而熵越低，值的 “可预测性” 越强，压缩算法（如算术编码）能更高效地减少比特流大小。
 ![alt text](kvcache.assets/3.png)
 
+下面以 $2\ Layer、3\ Token、3\ Channel$ 来直观体验熵减与算术编码的魅力：
+\[
+\text{Layer 1 V} = \begin{pmatrix} 
+0.6 & 0.3 & 0.1 \\
+0.2 & 0.8 & 0.0 \\
+0.5 & 0.2 & 0.3
+\end{pmatrix}
+\]
+
+\[
+\text{Layer 2 V} = \begin{pmatrix} 
+0.8 & 0.2 & 0.1 \\
+0.9 & 0.3 & 0.05 \\
+0.7 & 0.1 & 0.15
+\end{pmatrix}
+\]
+
+熵 $H = -\sum p_i \log_2 p_i$（$p_i$ 为某值的出现概率），将所有 V 值量化为 3 种符号（$A\in[0.0,0.3],\ B\in[0.4,0.6],\ C\in[0.7,0.9]$），统计概率后得到熵：
+
+#### No grouping 组：
+\[
+[0.6(\text{B}), 0.3(\text{A}), 0.1(\text{A}),\ 0.2(\text{A}), 0.8(\text{C}), 0.0(\text{A}),\ 0.5(\text{B}), 0.2(\text{A}), 0.3(\text{A})\ ...]
+\]
+- 符号统计：A 出现 11 次，B 出现 2 次，C 出现 5 次；
+- 概率：$p_A=11/18≈0.61$，$p_B=2/18≈0.11$，$p_C=5/18≈0.28$；
+- 熵：$H = -0.61\log_20.61 -0.11\log_20.11 -0.28\log_20.28 ≈ 1.45$。
+
+#### By token 组：
+将相同位置（行）的 Token 的 V 值归为一组，共 3 组：
+- Token1组：符号=[B, A, A, C, A, A] → A=4, B=1, C=1 → 熵≈1.46；
+- Token2组：符号=[A, C, A, C, A, A] → A=4, C=2 → 熵≈1.0；
+- Token3组：符号=[B, A, A, C, A, A] → A=4, B=1, C=1 → 熵≈1.46；
+- 平均熵：$(1.46+1.0+1.46)/3 ≈ 1.31$。
+
+#### By channel 组：
+将相同通道（列）的 V 值归为一组，共 3 组：
+- 通道 0 组：符号=[B, A, B, C, C, C] → B=2, C=3, A=1 → 熵≈1.46；
+- 通道 1 组：符号=[A, C, A, A, A, A] → A=5, C=1 → 熵≈0.65；
+- 通道 2 组：符号=[A, A, A, A, A, A] → A=6 → 熵=0；
+- 平均熵：$(1.46+0.65+0)/3 ≈ 0.70$。
+
+#### By layer 组：
+将每层的所有通道、Token V值归为一组，共2组（第1层、第2层）：
+- **第1层组**：符号=[B, A, A, A, C, A, B, A, A] → A=5, B=2, C=1 → 熵≈1.36；
+- **第2层组**：符号=[C, A, A, C, A, A, C, A, A] → A=5, C=3 → 熵≈1.29；
+- 平均熵：$(1.36+1.29)/2 ≈ 1.33$ 比特/元素（虽有降低，但不如按通道分组显著）。
+
+分组后各通道的符号 “集中”，熵自然大幅降低，算术编码能为高频符号分配极短比特，最终实现高压缩比。
+
+### 自适应流传输（Adaptive Streaming）
+- **操作**：根据实时带宽动态适应传输内容，在 CacheGen 中将上下文拆分为多个上下文块（论文中以 1.5k token 作为默认块长），每个块都压缩不同精度的版本，传输时根据实时带宽选择最合适版本，如带宽极差时，则直接传输原始上下文予 CPU 重新计算。
+- **原理**：压缩方法即张量量化 → 聚类（存储索引）→ 按 “Layer + Channel” 分组得到序列，如 [1, 2, 0, 1] → [转比特流](https://zhuanlan.zhihu.com/p/390684936)。
