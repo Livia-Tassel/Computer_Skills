@@ -61,6 +61,8 @@ r_w = \frac{\alpha}{\sqrt{m_t}} \times \text{median}(W) = \frac{5e-5}{0.02} \tim
 代码：https://github.com/UChi-JCL/CacheGen
 年份：2024.7.19
 核心：长上下文 KV 缓存网络传输延迟高
+![alt text](kvcache.assets/2.png)
+
 ## 名词解释
 - 张量（Tensor）：高维向量，CacheGen 核心在于通过编码技术，将大张量转化为小的 “比特流”，传输后再解码恢复为张量。
 - Delta 编码（Delta Coding）：即残差编码，使得量化和算术编码压缩效率更高。
