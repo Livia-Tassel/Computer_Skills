@@ -89,7 +89,7 @@ docker push livia/custom-ubuntu
  Copy Code（复制源码）：将 Dockerfile 所在目录下所有文件复制到镜像内部的新目录 /opt/source-code 中，通常是测试代码。
  Sepcify Entrypoint（指定入口）：指定容器从该镜像启动时，默认执行的命令。
 
- ## CMD
+## CMD
 CMD 和 ENTRYPOINT 在 Dockerfile 中都是“容器启动时要执行的命令”，但它们的**核心区别**在于：「主命令」、「默认参数」，以及在 `docker run` 时能否覆盖。
 
 ### 🐳
@@ -101,7 +101,7 @@ CMD 和 ENTRYPOINT 在 Dockerfile 中都是“容器启动时要执行的命令�
 | 能否被 `docker run` 覆盖 | ✅ 会 | ⚙️ 不会 |
 | 常见用法 | 提供可变参数 | 定义不可变的主执行命令 |
 
-### 只有 CMD 的情况
+1. 只有 CMD 的情况
 ```Dockerfile
 FROM ubuntu
 CMD ["sleep", "5"]
@@ -119,7 +119,7 @@ docker run myimage echo "hello"
 ```
 👉 执行 `echo "hello"`（`sleep 5` 被覆盖）。
 
-### 只有 ENTRYPOINT 的情况
+2. 只有 ENTRYPOINT 的情况
 ```Dockerfile
 FROM ubuntu
 ENTRYPOINT ["sleep"]
@@ -137,7 +137,7 @@ docker run myimage
 ```
 👉 报错：`sleep: missing operand`，因为 ENTRYPOINT 不会自动附带参数。
 
-### ENTRYPOINT + CMD 组合
+3. ENTRYPOINT + CMD 组合
 ```Dockerfile
 FROM ubuntu
 ENTRYPOINT ["sleep"]
@@ -159,3 +159,32 @@ docker run myimage 10
 # 环境变量
 通常在 Docker 中会有一些环境值占位符可以用 `-e` 指明，若不指明则为默认值。
 ![alt text](dadv.assets/4.png)
+
+# Docker Compose
+当程序由多个服务组成时（如 Web、缓存等），如果只用 `docker run`：
+- 每个服务都要单独运行命令
+- 手动配置网络、端口、卷等
+- 服务之间的依赖关系
+
+Docker Compose 能让多容器应用 “一条命令启动，一条命令停止”，就像编译中的 cmake 一样，其核心在于 `docker-compose.yml` 文件，包含要运行的服务（service）、网络、卷等：
+```yml
+version: '3'
+services:
+  web:
+    image: simple-webapp
+    ports:
+      - "8080:8080"
+  mongo:
+    image: mongo
+  redis:
+    image: redis:alpine
+```
+| 命令 | 描述 |
+| :---: | :---: |
+| docker compose up | 启动所有服务 |
+| docker compose up -d | 后台启动 |
+| docker compose down | 停止并删除容器 |
+| docker compose ps | 查看 compose 启动的服务 |
+| docker compose logs | 查看 compose 日志 |
+
+[Demo for Docker Compose](https://learn.kodekloud.com/user/courses/docker-training-course-for-the-absolute-beginner/module/e4f7711c-d82a-4953-ab4c-bce10b901ed9/lesson/4af86780-4231-4629-ba0f-1c7be812b70b?autoplay=true)、[Install Docker Compose](https://docs.docker.com/compose/install)
