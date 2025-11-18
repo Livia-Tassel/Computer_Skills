@@ -188,3 +188,40 @@ services:
 | docker compose logs | 查看 compose 日志 |
 
 [Demo for Docker Compose](https://learn.kodekloud.com/user/courses/docker-training-course-for-the-absolute-beginner/module/e4f7711c-d82a-4953-ab4c-bce10b901ed9/lesson/4af86780-4231-4629-ba0f-1c7be812b70b?autoplay=true)、[Install Docker Compose](https://docs.docker.com/compose/install)
+
+# Docker Engine
+## 概览
+- **Docker Engine** 是 Docker 平台的核心组件，管理镜像、容器、网络和存储。
+- 采用**客户端-服务器（Client-Server）架构**：
+  - **Docker CLI（客户端）**：用户与 Docker 交互的命令行工具（`docker`）。
+  - **Docker Daemon（守护进程）`dockerd`（服务器）**：实际执行镜像拉取、容器创建、网络管理等操作，并暴露出 REST API。
+  - **REST API**：Docker Daemon 提供的 HTTP API，供 CLI、GUI 或其它自动化工具调用。
+- 现代 Docker Engine 栈包含：`dockerd` → `containerd` → `runc`（或其他运行时），其中 `containerd` 负责容器生命，`runc` 执行容器进程（使用 Linux namespaces、cgroups）。
+
+# Docker Storage
+- Docker 存储（Storage）涵盖**镜像**、**容器可写**、**存储驱动（storage driver）**、**卷（volumes）**、**绑定挂载（bind mounts）** 与 **tmpfs** 等概念。
+- 默认宿主机路径是 `/var/lib/docker`，里面包含镜像、容器、卷、overlay/aufs 等存储驱动相关目录。
+![alt text](dadv.assets/5.png)
+
+## 写时复制
+- 镜像由多个**只读片**组成；当基于镜像启动容器时，Docker 在其上创建一个**可写片**（container writable layer）。
+- 写时复制（CoW）机制：只有当容器修改文件时，才会在可写片创建新副本，节省磁盘空间。
+- 镜像片由存储驱动负责并可被多个容器共享。
+![alt text](dadv.assets/6.png)
+
+## 存储驱动（Storage Drivers）
+- 常见驱动：`overlay2`（推荐）、`aufs`（较旧）、`devicemapper`、`btrfs`、`zfs` 等。
+- 驱动职责：镜像片与容器片的合并与存储实现。
+
+## 卷 vs 绑定挂载 vs tmpfs
+1. **Volumes（命名卷 / Docker 操作）**
+   - 由 Docker 操作，存放在 Docker 的存储位置（如 `/var/lib/docker/volumes/...`）。
+   - 可用 `docker volume create`、`docker volume ls`、`docker volume inspect`、`docker volume rm` 操作。
+   - 常用于持久化、在容器间共享、以及 Compose 中声明持久化。
+
+2. **Bind mounts（绑定挂载宿主机路径）**
+   - 把宿主机上的目录或文件挂载到容器内（`-v /host/path:/container/path` 或 `--mount type=bind`）。
+
+3. **tmpfs**
+   - 临时内存文件系统，仅存在内存（未持久化），适合缓存。
+   - 示例：`docker run -d --tmpfs /tmp:rw,size=64m myimage`
