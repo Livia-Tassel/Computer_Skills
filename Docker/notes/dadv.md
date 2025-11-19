@@ -225,3 +225,37 @@ services:
 3. **tmpfs**
    - 临时内存文件系统，仅存在内存（未持久化），适合缓存。
    - 示例：`docker run -d --tmpfs /tmp:rw,size=64m myimage`
+
+# 网络
+Docker 安装后自动创建三个网络：
+![alt text](dadv.assets/7.png)
+
+## bridge（默认网络）
+* 容器默认加入 bridge 网络。
+* Docker 会给容器分配私有 IP，并提供 NAT，让容器可以访问外部网络。
+* 多个容器在同一个 bridge 下可以互相通信。
+* 命令：
+  ```bash
+  docker run ubuntu
+  docker run --network=bridge ubuntu
+  ```
+### 自定义网络
+容器默认加入 bridge 网络，如果想隔离部分容器，可以自定义网络。另外，通过 `docker inspect` 可以找到 bridge 部分配置，检查当前容器的网络，IP 以及 MAC 地址：
+![alt text](dadv.assets/8.png)
+
+## none
+* 容器没有网络接口（除了 loopback）。
+* 容器无法访问其他容器和外网，完全隔离。
+* 命令：
+  ```bash
+  docker run --network=none ubuntu
+  ```
+
+## host
+* 容器直接占用宿主机网络栈。
+* 不再有独立 IP，端口冲突风险大。
+* 网络性能最好。
+* 命令：
+  ```bash
+  docker run --network=host ubuntu
+  ```
