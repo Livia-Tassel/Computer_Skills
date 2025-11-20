@@ -4,11 +4,23 @@
 
 [TOC]
 
+# A Survey on Efficient Inference for Large Language Models
+论文：https://arxiv.org/abs/2404.14294
+代码：无
+年份：2024.7.19
+核心：LLM 高效推理综述
+
+
+
+
+
+
 # ExCP: Extreme LLM Checkpoint Compression via Weight-Momentum Joint Shrinking
 论文：https://arxiv.org/abs/2406.11257
 代码：https://github.com/Gaffey/ExCP
 年份：2024.6.17
 核心：checkpoint 的存储压缩
+
 ## 名词解释
 - 检查点（Checkpoint）：LLM 训练途中定期保存参数、优化器状态等信息，避免意外情况导致模型从头训练。
 - 优化器（Optimizer）：优化器本质上是一种算法，根据 LLM 的损失值与梯度得出参数优化的方向与步长。常见的优化器如 “Adam” 的检查点除上述信息外，还会保存 “动量状态”（几乎和 LLM 参数一样大），为此 ExCP 论文中尝试利用联合权重和动量剪枝来对 LLM checkpoint 进行压缩。
@@ -136,3 +148,68 @@ r_w = \frac{\alpha}{\sqrt{m_t}} \times \text{median}(W) = \frac{5e-5}{0.02} \tim
 ### 自适应流传输（Adaptive Streaming）
 - **操作**：根据实时带宽动态适应传输内容，在 CacheGen 中将上下文拆分为多个上下文块（论文中以 1.5k token 作为默认块长），每个块都压缩不同精度的版本，传输时根据实时带宽选择最合适版本，如带宽极差时，则直接传输原始上下文予 CPU 重新计算。
 - **原理**：压缩方法即张量量化 → 聚类（存储索引）→ 按 “Layer + Channel” 分组得到序列，如 [1, 2, 0, 1] → [转比特流](https://zhuanlan.zhihu.com/p/390684936)。
+
+# GEAR: An Efficient KV Cache Compression Recipe for Near-Lossless Generative Inference of LLM
+论文：https://arxiv.org/html/2403.05527
+代码：https://github.com/HaoKang-Timmy/GEAR
+年份：2024.9.30
+核心：KV Cache 近无损存储压缩
+![alt text](kvcache.assets/8.png)
+
+## 核心方法
+GEAR 通过 “量化主干+低秩近似+稀疏修正” 的三级架构，实现 “高压缩比-近无损性能” 平衡，具体流程如下：
+$$\min_{\hat{D}, L, S} \|X - \hat{D} - L - S\|_F$$
+
+### 步骤 1：基于异常值过滤的量化主干（$\hat{D}$）
+先提取 KV 张量中的极值异常值，再对剩余值进行超低精度量化，避免异常值导致的量化误差放大。
+
+1. 异常值提取：对 Key 张量（按 channel 分组）和 Value 张量（按 token 分组），分别提取每个分组内 $\frac{s}{2}\%$ 的最大值与 $\frac{s}{2}\%$ 的最小值，构成稀疏矩阵 $S \in \mathbb{R}^{n \times d}$：  
+    $$S_{ij} = \begin{cases} 
+    X_{ij} & \text{if} \ X_{ij} \in \text{top/bottom } \frac{s}{2}\% \ \text{of group} \\
+    0 & \text{else}
+    \end{cases}$$
+
+    （论文中 $s=2\%$，即仅保留 2% 的异常值，内存开销 \<3%）
+2. 分组量化：对过滤后的 $X - S$ 采用 **per-channel Key + per-token Value** 量化（基于 KCVT/KIVI 变体），量化公式为：  
+    $$\hat{D}_{\mathcal{G}_i} = \left\lfloor \frac{(X - S)_{\mathcal{G}_i} - \min_{\mathcal{G}_i} (X - S)}{\Delta_i} \right\rceil, \quad \Delta_i = \frac{\max_{\mathcal{G}_i} (X - S) - \min_{\mathcal{G}_i} (X - S)}{2^b - 1}$$  
+    其中 $\mathcal{G}_i$ 为分组 $i$，$b$ 为量化位宽（2-bit/4-bit），$\Delta_i$ 为缩放因子。
+
+### 步骤 2：头级别低秩近似（$L$）
+量化残差 $R = X - \hat{D} - S$ 存在**相干结构**（即不同 token 共享部分上下文信息），通过低秩矩阵捕捉该结构，修正量化误差。
+
+1. 头级别分解：将残差 $R$ 按注意力头拆分，得到 $H$ 个子矩阵 $R_h \in \mathbb{R}^{n \times d_H}$（$d_H = d/H$ 为单头维度）；
+2. 低秩逼近：对每个 $R_h$，通过**幂迭代算法**（高效 SVD 近似）得到 top-$r$ 奇异值与向量，构建低秩矩阵 $L_h = A_h B_h^\top$（$A_h \in \mathbb{R}^{n \times r}$，$B_h \in \mathbb{R}^{d_H \times r}$），最终拼接为 $L = \text{Concat}(L_1, ..., L_H)$；
+3. 秩选择：论文中 $r=4$（prefill 阶段）/$r=2$（解码阶段），此时 $L$ 的内存开销仅为原始 $X$ 的 $\frac{r}{d} \approx 3.125\%$（$d=128$ 时）。
+
+### 步骤 3：误差融合与重建
+- **最终压缩张量**：$\hat{X} = \hat{D} + L + S$，满足 $\|X - \hat{X}\|_F \ll \|X - \hat{D}\|_F$（量化误差降低 80% 以上）；
+- **流缓冲优化**：引入大小为 $n_b=20$ 的缓冲区，每生成 $n_b$ 个 token 批量执行上述压缩，比逐令牌压缩延迟降低 40%。
+
+以下是在不同量化技术的基础上加上 GEAR 获得的效果：
+<table>
+<tr align="center">
+    <td><img src="kvcache.assets/6.png" width="300"></td>
+    <td><img src="kvcache.assets/7.png" width="300"></td>
+</tr>
+</table>
+
+## IDEAL
+流版 Bitwise Gear 完全保留原版 Gear “拆分易压/难压部分 → 分模块处理 → 协同重建” 的分治逻辑，但针对 MNN 端侧 **CPU 算力有限、内存/存储资源紧张、精度要求 100% 无损**的特性，将原版 “量化 + SVD 低秩” 的有损算子，改为**位操作 + 流式无损压缩**的硬件友好型算子，最终实现 “Bit-exact 无损压缩” 与 “端侧无感推理” 的双重目标。
+
+### 步骤 1：Base 流提取 —— 高低位拆分
+FP16 由 “1 位符号 + 5 位指数 + 10 位尾数” 构成：
+- **高 8 位**：在同一 Channel/Attention Head 内，因上下文语义相关性强，分布稳定，熵值极低，属于 “易压部分”，对应原版 Gear 的 “基准部分”；
+- **低 8 位**：长序列下存在局部统计规律，属于 “难压部分”，对应原版 Gear 的 “残差部分”。
+
+将原始 KV 张量 $X \in \text{FP16}^{n \times d}$（$n$ 为序列长度，$d$ 为特征维度）拆分为 Base 流 $\hat{D}$：所有 FP16 的高 8 位，存储为`uint8_t`型，尺寸为 $n \times d$（字节数仅为原始的 1/2）；Residual 流 $R$：所有 FP16 的低 8 位，同样存储为`uint8_t`型，尺寸与 Base 流一致。
+
+通过 NEON 的`vst2q_u8`指令，将拆分后的高低位 “交织” 写入内存，避免朴素循环中 “Base流/Residual流反复切换导致的 Cache Line 颠簸”，内存带宽打满。
+
+### 步骤 2：Residual 流压缩
+原版 Gear 用 SVD 低秩分解捕捉残差的“全局相干性”（有损），而 Bitwise Gear 利用 Zstd 压缩的 “字典记忆 + 滑动窗口” 特性，捕捉 Residual 流的“局部序列相关性”（无损）：
+
+ **双流并行压缩**：为 Base 流和 Residual 流分别创建独立的 Zstd 流上下文，Base 流压缩比可达 5× 以上；Residual 流压缩比可达 1.2×~1.5×，最后将两个流的压缩结果封装为 “双流压缩块”。
+
+### 步骤3：流式缓冲与无损重建
+#### ① 压缩阶段：4KB Page Buffer批量处理
+#### ② 解压重建阶段：预取 + NEON 快速拼接
