@@ -259,3 +259,6 @@ Docker 安装后自动创建三个网络：
   ```bash
   docker run --network=host ubuntu
   ```
+
+# Docker Register
+Docker Registry 是存储 Docker 镜像的中央仓库，所有的镜像都可以从 Registry 中拉取（pull），也可以推送（push）到 Registry。最典型的 Registry 是 **Docker Hub**。
