@@ -10,11 +10,6 @@
 年份：2024.7.19
 核心：LLM 高效推理综述
 
-
-
-
-
-
 # ExCP: Extreme LLM Checkpoint Compression via Weight-Momentum Joint Shrinking
 论文：https://arxiv.org/abs/2406.11257
 代码：https://github.com/Gaffey/ExCP
@@ -208,8 +203,10 @@ FP16 由 “1 位符号 + 5 位指数 + 10 位尾数” 构成：
 ### 步骤 2：Residual 流压缩
 原版 Gear 用 SVD 低秩分解捕捉残差的“全局相干性”（有损），而 Bitwise Gear 利用 Zstd 压缩的 “字典记忆 + 滑动窗口” 特性，捕捉 Residual 流的“局部序列相关性”（无损）：
 
- **双流并行压缩**：为 Base 流和 Residual 流分别创建独立的 Zstd 流上下文，Base 流压缩比可达 5× 以上；Residual 流压缩比可达 1.2×~1.5×，最后将两个流的压缩结果封装为 “双流压缩块”。
+**双流并行压缩**：为 Base 流和 Residual 流分别创建独立的 Zstd 流上下文，Base 流压缩比可达 5× 以上；Residual 流压缩比可达 1.2×~1.5×，最后将两个流的压缩结果封装为 “双流压缩块”。
 
 ### 步骤3：流式缓冲与无损重建
 #### ① 压缩阶段：4KB Page Buffer批量处理
 #### ② 解压重建阶段：预取 + NEON 快速拼接
+
+# 
