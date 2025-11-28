@@ -209,4 +209,62 @@ FP16 由 “1 位符号 + 5 位指数 + 10 位尾数” 构成：
 #### ① 压缩阶段：4KB Page Buffer批量处理
 #### ② 解压重建阶段：预取 + NEON 快速拼接
 
-# 
+# LoMA: Lossless Compressed Memory Attention
+论文：https://ar5iv.labs.arxiv.org/html/2401.09486
+代码：无
+年份：2024.1.16
+核心：KV Cache （近）无损压缩记忆注意力
+
+## 核心方法
+LoMA 的核心是 “训练时学习压缩/验证，推理时执行压缩/生成”：
+### 训练阶段
+训练的核心是 “**阅读区（原始信息）→ 内存区（压缩信息）→ 重复区（验证压缩）**”的闭环。
+#### 步骤 1：输入序列的结构化重组
+LoMA 将原始训练序列拆分为多个**训练块（Training Chunk）**，每个块强制包含 3 个区域，且引入 2 个 token：  
+- $m$（Memory Token）：存储压缩后的信息，放在 “内存区”；  
+- $r$（Repetition Token）：验证压缩是否无损，放在 “重复区”。  
+
+![alt text](kvcache.assets/9.png)
+
+为此，训练块的结构公式为：  
+$$Training\ Chunk = Reading\ Zones(t_c) + Memory\ Zones(t) + Repetition\ Zones(t_c)$$
+
+其中：  
+- $t_c = c × t$（$c$ 为**压缩比**）；  
+- 阅读区：原始文本 token（如“今天天气晴朗，适合去公园散步”）；  
+- 内存区：$t$ 个 $m$ token（如 $m\ m$）；  
+- 重复区：$t_c$ 个 $r$ token（如 $r\ r\ r\ r\ r\ r\ r\ r$）。  
+
+#### 步骤 2：特殊注意力掩码
+普通 Transformer 用 “下三角掩码” 实现自回归，但 LoMA 通过**自定义掩码**强制规定三个区域的信息流向，避免模型 “作弊”，三种区域的掩码规则如下：
+
+![alt text](kvcache.assets/11.png)
+![alt text](kvcache.assets/12.png)
+
+#### 步骤 3：间接监督损失
+LoMA 不为 “内存区的 $m$” 设计标签，而是通过**重复区的损失间接监督<m>的压缩能力**，形成 “压缩质量 → 复现效果 → 损失反馈” 的闭环。  
+
+$$L = L_{Read} + L_{Rep}$$  
+
+其中
+- $L_{Read}$：普通 LLM 的自回归损失（如交叉熵）；  
+- $L_{Rep}$：核心监督项，要求 “重复区的 $r$ token 必须完全复现原始信息”，损失为<r>的预测结果与原文本的交叉熵。  
+
+注：原论文中特殊位置 ID（保证压缩后上下文连贯性）忽略。
+
+### 推理阶段
+训练完成后，模型已具备 “将长 KV Cache 压缩为短 $m$ KV” 的能力，推理时无额外辅助模型，仅通过 3 步即可完成无损压缩，且融入 autoregressive 生成流程。
+
+假设训练好的 Llama-2-7B 模型进行 “问如何煮咖啡” 的长对话推理，设置 $c=4$、$t=2$：  
+
+1. **步骤 1：初始化**  
+   模型按标准 autoregressive 方式生成 $t_c=8$ 个 token，如 “问如何煮咖啡，要详细步骤”，同时得到这 8 个 token 对应的 KV Cache（记为 $KV_{Read}$）。  
+
+2. **步骤 2：输入 $m$ token**  
+   向模型输入 $t=2$ 个 $m$ token，模型基于步骤 1 的 $KV_{Read}$ 执行一次推理：  
+   - 此时模型会将 $KV_{Read}$ 中的所有信息（“问如何煮咖啡，要详细步骤” 的上下文）压缩到 2 个 $m$ 的 KV Cache 中（记为 $KV_{Compressed}$）；  
+   - 训练时 $m$ 已学会存储所有必要信息，2 个 $m$ 的 KV 完全等价于 8 个原始 token 的KV。  
+
+3. **步骤 3：驱逐原始 KV**  
+   驱逐步骤 1 的 $KV_{Read}$，仅保存 $KV_{Compressed}$，模型基于 $KV_{Compressed}$ 完成回答，回答过程中又得到新的 token，重复步骤 2-3。  
+
