@@ -76,9 +76,66 @@ $$
 
 特别地，当我们模拟同一个随机过程两次时，可能得到不同的结果，因为其动力学设计为随机的。
 
+### 布朗运动
+随机微分方程是通过布朗运动构造的，你可以把布朗运动看作随机游走。布朗运动 $W=(W_t)_{0\le t\le 1}$ 是一个随机过程，$W_0=0$，轨迹 $t\mapsto W_t$，且符合以下两个条件：
+1. **正态增量：** $W_t-W_s \sim \mathcal{N}(0,(t-s)I_d)$ 对于所有 $0\le s<t$，即增量具有方差随时间线性递增的高斯分布（$I_d$ 为单位矩阵）。
 
+2. **独立增量：** 对于任意 $0\le t_0<t_1<\cdots<t_n=1$，增量 $W_{t_1}-W_{t_0},\ldots,W_{t_n}-W_{t_{n-1}}$ 是独立的随机的。
 
+![alt text](flow-diffusion.assets/8.png)
 
+### 随机微分方程
+由于布朗运动的随机性，$W_t$ 无法求导，为此，将常微分方程的等价形式表述如下：
+$$
+\frac{d}{dt}X_t = u_t(X_t)\\
+\Longleftrightarrow\quad
+\frac{1}{h}\bigl(X_{t+h}-X_t\bigr)=u_t(X_t)+R_t(h)\\
+\Longleftrightarrow\quad
+X_{t+h}=X_t+h\,u_t(X_t)+h\,R_t(h).
+$$
+
+其中 $R_t(h)$ 描述了 $h$ 的误差项，即 $\lim_{h\to 0} R_t(h)=0$，这样一个 SDE 的轨迹 $(X_t)_{0\le t\le 1}$ 在每个时间步都带有一小步向 $u_t(X_t)$ 的方向，并加上布朗运动的部分贡献：
+$$
+X_{t+h}=X_t+ h\,u_t(X_t)+ \sigma_t\bigl(W_{t+h}-W_t\bigr)+ h\,R_t(h)
+$$
+
+其中 $\sigma_t\ge 0$ 为扩散参数，$R_t(h)$ 为随机误差项，于是标准差 $\mathbb{E}\!\left[\|R_t(h)\|^2\right]^{1/2}\to 0 \text{，当 } h\to 0$ 时。上述过程描述了一个随机微分方程：
+$$
+dX_t = u_t(X_t)\,dt + \sigma_t\,dW_t\\
+X_0 = x_0
+$$
+
+然而，始终记住，上面的 $dX_t$ 是非正式符号。且 SDE 现在已经没有流映射 $\phi_t$ 了，因为值 $X_t$ 不再完全由 $X_0\sim p_{\text{init}}$ 决定，演化本身即随机的。
+
+### 欧拉-马鲁亚马方法
+欧拉-马鲁亚马对于随机微分方程的作用，就像欧拉方法对于常微分方程的作用一样。我们初始化 $X_0=x_0$ 并进行如下迭代即可求解以上随机微分方程：
+$$
+X_{t+h}=X_t + h\,u_t(X_t) + \sqrt{h}\,\sigma_t\,\epsilon_t, \quad \epsilon_t \sim \mathcal{N}(0, I_d)
+$$
+
+其中 $h=n^{-1}>0$ 为 $n\in\mathbb{N}$ 的迭代步长。
+
+### 扩散模型
+现在，我们终于可以通过 SDE 得到扩散生成模型，向量场 $u_t$ 仍代表一个神经网络：
+
+**Algorithm** Sampling from a Diffusion Model (Euler-Maruyama method).
+**Require:** Neural network $u_t^{\theta}$, number of steps $n$, diffusion coefficient $\sigma_t$.
+1. Set $t=0$
+2. Set step size $h=\frac{1}{n}$
+3. Draw a sample $X_0 \sim p_{\text{init}}$
+4. **for** $i=1,\ldots,n$ **do**
+5. &nbsp;&nbsp;&nbsp;&nbsp;Draw a sample $\epsilon \sim \mathcal{N}(0, I_d)$
+6. &nbsp;&nbsp;&nbsp;&nbsp;$X_{t+h} = X_t + h\,u_t^{\theta}(X_t) + \sigma_t\sqrt{h}\,\epsilon$
+7. &nbsp;&nbsp;&nbsp;&nbsp;Update $t \leftarrow t+h$
+8. **end for**
+9. **return** $X_1$
+
+因此，得到扩散模型如下：
+$$
+X_0 \sim p_{\text{init}}\\
+dX_t = u_t^{\theta}(X_t)\,dt + \sigma_t\,dW_t
+$$
+![alt text](flow-diffusion.assets/9.png)
 
 
 
