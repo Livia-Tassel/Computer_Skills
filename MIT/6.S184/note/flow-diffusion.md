@@ -137,6 +137,163 @@ dX_t = u_t^{\theta}(X_t)\,dt + \sigma_t\,dW_t
 $$
 ![alt text](flow-diffusion.assets/9.png)
 
+# 模型训练
+## 训练目标
+**训练**神经网络 $u_t^{\theta}$，可以通过最小化损失 $C(\theta)$ 来实现：
+\[
+C(\theta)=\left\lVert u_t^{\theta}(x)-u_t^{\text{target}}(x)\right\rVert_2^{2},
+\qquad
+\underbrace{u_t^{\text{target}}(x)}_{\text{training target}}
+\]
 
+其中，$u_t^{\text{target}}(x)$ 是希望逼近的**训练目标**。本章的目标是为训练目标 $u_t^{\text{target}}$ 找到一个可表述的方程；下一章将描述一种逼近 $u_t^{\text{target}}$ 的训练算法。自然地，像神经网络 $u_t^{\theta}$ 一样，训练目标本身也应当是一个向量场：
+\[
+u_t^{\text{target}}:\mathbb{R}^d\times[0,1]\to\mathbb{R}^d.
+\]
+
+![alt text](flow-diffusion.assets/10.png)
+
+### 条件概率路径与边际概率路径
+流匹配首先指定一条**概率路径**。直观地，概率路径刻画了 $p_{\text{init}}$ 与 $p_{\text{data}}$ 之间的渐变插值。也就是说，$t=0$ 时分布是 $p_{\text{init}}$，$t=1$ 时分布是 $p_{\text{data}}$。那么在起点与终点之间的中间时刻 $0<t<1$，“应该” 处于什么分布？
+
+事实上，存在一定的自由性：端点条件符合，$0<t<1$ 的中间分布并不唯一。而**概率路径**正是对这种自由性进行刻画的一种方式：它规定了从 $p_{\text{init}}$ 到 $p_{\text{data}}$ 的过程应如何随时间演化。
+
+为此，构造训练目标 $u_t^{\text{target}}$ 首先得**指定一条概率路径**。直观地，概率路径描述了 $p_{\text{init}}$ 与 $p_{\text{data}}$ 之间的逐步插值。
+
+下文中，对于一个样本点 $z\in\mathbb{R}^d$，$\delta_z$ 表示 **Dirac delta “分布”**，即从 $\delta_z$ 抽样必返回 $z$。那么，一个**条件（插值）概率路径**就表示定义在 $\mathbb{R}^d$ 上的一族条件分布 $p_t(x\mid z)$（$t\in[0,1]$），符合：
+\[
+p_0(\,\cdot \mid z)=p_{\text{init}},\qquad
+p_1(\,\cdot \mid z)=\delta_z,\qquad
+\text{for all } z\in\mathbb{R}^d.
+\]
+
+即条件概率路径将初始分布 $p_{\text{init}}$ 逐步转化为**单个样本点**，也可以把概率路径理解为分布空间中的一条轨迹。每一条条件概率路径 $p_t(x\mid z)$ 都将诱导出一条**边际概率路径** $p_t(x)$：先从样本分布中抽样一个样本点 $z\sim p_{\text{data}}$，再从 $p_t(\,\cdot\mid z)$ 中采样所得到的分布：
+\[
+z\sim p_{\text{data}},\quad x\sim p_t(\,\cdot\mid z)
+\ \Rightarrow\ x\sim p_t.\\
+p_t(x)=\int p_t(x\mid z)\,p_{\text{data}}(z)\,dz.
+\]
+
+注意：我们**知道如何从** $p_t$ **进行采样**，但由于式中的积分往往不可解，于是**并不知道** $p_t(x)$ 的显式值。由端点条件可得，边际概率路径 $p_t(x\mid z)$ 在 $p_{\text{init}}$ 与 $p_{\text{data}}$ 之间插值：
+\[
+p_0=p_{\text{init}},\qquad p_1=p_{\text{data}}.
+\]
+
+![alt text](flow-diffusion.assets/11.png)
+> **常见的高斯条件路径：**  
+> \[
+> p_t(x\mid z)=\mathcal{N}\!\left(\alpha_t z,\;\beta_t^2 I_d\right).
+> \]
+> - 当 $t\to 1$ 时，$\alpha_t\to 1$ 且 $\beta_t\to 0$，则
+>   \[
+>   \mathcal{N}\!\left(\alpha_t z,\;\beta_t^2 I_d\right)\Rightarrow \delta_z,
+>   \]
+> - 当 $t\to 0$ 时，令 $\alpha_0=0,\ \beta_0=1$，则该分布不再依赖 $z$，退化为初始分布 $p_{\text{init}}=\mathcal{N}(0,I_d)$。
+>
+> 由上述**条件路径**可以立刻写出对应的**边际概率路径**：
+> \[
+> p_t(x)=\int p_t(x\mid z)\,p_{\text{data}}(z)\,dz
+> =\int \mathcal{N}\!\left(x;\alpha_t z,\;\beta_t^2 I_d\right)\,p_{\text{data}}(z)\,dz.
+> \]
+> 直观地，这是把 $p_{\text{data}}$ 经过**线性缩放**（乘以 $\alpha_t$）后，再做一次各向同性高斯**平滑/加噪**（方差 $\beta_t^2$）得到的分布。
+>
+> 若 $p_{\text{data}}$ 是由有限样本集 $\{z_i\}_{i=1}^N$ 给出的经验分布，则上式可写成显式的混合形式：
+> \[
+> p_t(x)=\frac{1}{N}\sum_{i=1}^N \mathcal{N}\!\left(x;\alpha_t z_i,\;\beta_t^2 I_d\right).
+> \]
+> 此时，$p_t(x)$ 是一个**高斯混合分布**，比如 $p_{\text{data}}=\tfrac12\,\delta_{-1}+\tfrac12\,\delta_{+1}$，并取一条简单的高斯条件路径：
+> \[
+> p_t(x\mid z)=\mathcal{N}(t z,\,(1-t^2)),\quad z\in\{-1,+1\},
+> \]
+> 那么边际概率路径如下：
+> \[
+> p_t(x)=\tfrac12\,\mathcal{N}(t,\,1-t^2)+\tfrac12\,\mathcal{N}(-t,\,1-t^2).
+> \]
+> - $t=0$：两个高斯均值都等于 $0$，混合后 $\mathcal{N}(0,1)$；
+> - $t$ 增大：两个高斯的均值向 $\pm 1$ 分开，同时方差 $1-t^2$ 逐渐减小；
+> - $t\to 1$：方差趋于 $0$，混合分布收缩为两个尖点 $-1$ 与 $+1$。
+
+### 条件向量场与边际向量场
+一个概率路径 $\bigl(p_t\bigr)_{0\le t\le 1}$ 指示轨迹上 $X_t$ 在每个时刻 $t$ 应该服从的分布。那么**如何找到一个向量场**，使得由该向量场生成的轨迹 $(X_t)$ 的边际分布符合 $X_t\sim p_t$？
+
+对于每个样本点 $z\in\mathbb{R}^d$，令 $u_t^{\text{target}}(\cdot\mid z)$ 表示一个**条件向量场**。我们希望它驱动的常微分方程在 $z$ 的条件下产生相应的条件概率路径 $p_t(\cdot\mid z)$，即：
+\[
+X_0 \sim p_{\text{init}},\quad 
+\frac{d}{dt}X_t = u_t^{\text{target}}(X_t\mid z)
+\Longrightarrow
+X_t \sim p_t(\cdot\mid z),\ \ (0\le t\le 1).
+\]
+
+乍一看，条件向量场似个废物：因为在 $z$ 的条件下，ODE 的所有轨迹终点都将坍缩到 $X_1 = z$，就像在重新生成一个已知的样本点而已。
+
+然而，条件向量场并非最终目的，我们在对 $z\sim p_{\text{data}}$ 进行边际化（或等价的混合）后，将这些条件动力学汇合成能产生边际概率路径 $p_t$ 的向量场，从而真正实现从 $p_{\text{init}}$ 到 $p_{\text{data}}$ 的生成。
+
+![alt text](flow-diffusion.assets/12.png)
+
+令 $u_t^{\text{target}}(x\mid z)$ 是一个条件向量场。据此，我们定义如下的**边际向量场**：
+\[
+u_t^{\text{target}}(x)
+=\int u_t^{\text{target}}(x\mid z)\,
+\frac{p_t(x\mid z)\,p_{\text{data}}(z)}{p_t(x)}\,dz .
+\]
+
+其中分母 $p_t(x)=\int p_t(x\mid z)\,p_{\text{data}}(z)\,dz$，权重 $\frac{p_t(x\mid z)\,p_{\text{data}}(z)}{p_t(x)}$ 正是后验分布 $p_t(z\mid x)$，因此也可以写成条件期望的形式：
+\[
+u_t^{\text{target}}(x)=\mathbb{E}_{z\sim p_t(z\mid x)}\!\left[u_t^{\text{target}}(x\mid z)\right].
+\]
+
+这样定义的 $u_t^{\text{target}}(x)$ 将**遵循边际概率路径** $p_t$，即：
+\[
+X_0 \sim p_{\text{init}},\quad 
+\frac{d}{dt}X_t = u_t^{\text{target}}(X_t)
+\Longrightarrow
+X_t \sim p_t,\ \ (0\le t\le 1).
+\]
+
+> 如前所述，令条件概率路径：
+> $$
+> p_t(\cdot\mid z)=\mathcal{N}\!\left(\alpha_t z,\;\beta_t^2 I_d\right),
+> $$
+>
+> 记 $\dot{\alpha}_t=\partial_t\alpha_t,\ \dot{\beta}_t=\partial_t\beta_t$，分别表示 $\alpha_t$ 与 $\beta_t$ 对时间求导。那么对应的高斯条件向量场如下：
+> \[
+> u_t^{\text{target}}(x\mid z)
+> =\left(\dot{\alpha}_t-\frac{\dot{\beta}_t}{\beta_t}\alpha_t\right)z+\frac{\dot{\beta}_t}{\beta_t}\,x.
+> \]
+
+### 条件得分与边际得分
+目前已经成功构造了一个**流模型**的训练目标，现在将这一推导扩展到 **SDE**。为此，把边际分布 $p_t$ 的**边际得分**定义：
+\[
+\nabla \log p_t(x).
+\]
+
+由条件向量场与边际向量场 $u_t^{\text{target}}(x\mid z)$ 和 $u_t^{\text{target}}(x)$，对于任意 $\sigma_t\ge 0$，可以构造一个**遵循同一条概率路径** $p_t$ 的随机微分方程：
+\[
+X_0\sim p_{\text{init}},\quad
+dX_t=\Bigl[u_t^{\text{target}}(X_t)+\frac{\sigma_t^2}{2}\,\nabla\log p_t(X_t)\Bigr]dt+\sigma_t\,dW_t.
+\]
+
+从而其边际分布符合 $X_t\sim p_t,\ (0\le t\le 1)$。特别地，这个 SDE 的终点分布符合 $X_1\sim p_{\text{data}}$。此外，如果将边际概率路径 $p_t(x)$ 与边际向量场 $u_t^{\text{target}}(x)$ 分别换成条件概率路径 $p_t(x\mid z)$ 与条件向量场 $u_t^{\text{target}}(x\mid z)$，上述结论同样成立。
+
+类似地，可以由**条件得分** $\nabla\log p_t(x\mid z)$ 来表示**边际得分** $\nabla\log p_t(x)$：
+\[
+\nabla\log p_t(x)
+=\frac{\nabla p_t(x)}{p_t(x)}
+=\frac{\nabla\int p_t(x\mid z)\,p_{\text{data}}(z)\,dz}{p_t(x)}
+=\frac{\int \nabla p_t(x\mid z)\,p_{\text{data}}(z)\,dz}{p_t(x)}
+=\int \nabla\log p_t(x\mid z)\,
+\frac{p_t(x\mid z)\,p_{\text{data}}(z)}{p_t(x)}\,dz.
+\]
+
+其中 $p_t(x)=\int p_t(x\mid z)p_{\text{data}}(z)\,dz$。
+
+> 对于高斯条件概率路径 $p_t(x\mid z)=\mathcal{N}\!\left(x;\alpha_t z,\;\beta_t^2 I_d\right)$，其**条件得分**如下：
+> \[
+> \nabla_x \log p_t(x\mid z)
+> =\nabla_x \log \mathcal{N}\!\left(x;\alpha_t z,\;\beta_t^2 I_d\right)
+> = -\,\frac{x-\alpha_t z}{\beta_t^2}.
+> \]
+
+![alt text](flow-diffusion.assets/13.png)
 
 
