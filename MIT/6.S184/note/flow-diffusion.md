@@ -294,6 +294,116 @@ dX_t=\Bigl[u_t^{\text{target}}(X_t)+\frac{\sigma_t^2}{2}\,\nabla\log p_t(X_t)\Bi
 > = -\,\frac{x-\alpha_t z}{\beta_t^2}.
 > \]
 
-![alt text](flow-diffusion.assets/13.png)
+<table>
+<tr align="center">
+    <td><img src="flow-diffusion.assets/14.png" width="500"></td>
+    <td><img src="flow-diffusion.assets/13.png" width="500"></td>
+</tr>
+</table>
+
+## 训练模型
+### 流匹配
+为了让神经网络 $u_t^\theta$ 逼近边际向量场 $u_t^{\mathrm{target}}$，即 $u_t^\theta \approx u_t^{\mathrm{target}}$。记 $\mathrm{Unif}=\mathrm{Unif}([0,1])$ 为区间 $[0,1]$ 上的均匀分布，于是可以定义损失：
+\[
+\mathcal{L}_{\mathrm{FM}}(\theta)
+=\mathbb{E}_{t\sim \mathrm{Unif},\, x\sim p_t}
+\Big[\big\|u_t^\theta(x)-u_t^{\mathrm{target}}(x)\big\|^2\Big]\\
+\overset{(i)}{=}\;
+\mathbb{E}_{t\sim \mathrm{Unif},\, z\sim p_{\mathrm{data}},\, x\sim p_t(\cdot\mid z)}
+\Big[\big\|u_t^\theta(x)-u_t^{\mathrm{target}}(x)\big\|^2\Big]
+\]
+
+其中 $p_t(x)=\int p_t(x\mid z)\,p_{\mathrm{data}}(z)\,dz$ 为边际概率路径；在等式 $(i)$ 中，给出类似如下的采样过程：
+1) 采样一个随机时间 $t\in[0,1]$；  
+2) 从样本分布中采样 $z\sim p_{\mathrm{data}}$；  
+3) 从条件分布 $p_t(\cdot\mid z)$ 采样得到 $x$；  
+4) 输出 $u_t^\theta(x)$；  
+5) 输出 $u_t^\theta(x)$ 与边际向量场 $u_t^{\mathrm{target}}(x)$ 的均方误差。
+
+然而，由于 $u_t^{\mathrm{target}}$ 的表达式包含一个非人哉积分，转而定义**条件流匹配**损失：
+\[
+\mathcal{L}_{\mathrm{CFM}}(\theta)
+=\mathbb{E}_{t\sim \mathrm{Unif},\, z\sim p_{\mathrm{data}},\, x\sim p_t(\cdot\mid z)}
+\Big[\big\|u_t^\theta(x)-u_t^{\mathrm{target}}(x\mid z)\big\|^2\Big].
+\]
+
+即将边际向量场 $u_t^{\mathrm{target}}(x)$ 换为条件向量场 $u_t^{\mathrm{target}}(x\mid z)$，由于 $u_t^{\mathrm{target}}(x\mid z)$ 有解析表达式，因此可以最小化上述损失。且可以证明 $\mathcal{L}_{\mathrm{FM}}(\theta)=\mathcal{L}_{\mathrm{CFM}}(\theta)+C$，其中 $C$ 与 $\theta$ 无关。因此，$\nabla_\theta \mathcal{L}_{\mathrm{FM}}(\theta)=\nabla_\theta \mathcal{L}_{\mathrm{CFM}}(\theta)$，原问题转化为最小化条件流匹配。
+
+> 依旧回到高斯概率路径：$p_t(\cdot\mid z)=\mathcal{N}(\alpha_t z,\;\beta_t^2 I_d)$，可以从条件路径中按如下方式采样：
+> $$
+> \epsilon\sim\mathcal{N}(0,I_d)
+> \;\Rightarrow\;
+> x_t=\alpha_t z+\beta_t\epsilon \sim \mathcal{N}(\alpha_t z,\beta_t^2 I_d)=p_t(\cdot\mid z).
+> $$
+>
+> 条件向量场 $u_t^{\mathrm{target}}(x\mid z)=\left(\dot{\alpha}_t-\frac{\dot{\beta}_t}{\beta_t}\alpha_t\right)z+\frac{\dot{\beta}_t}{\beta_t}x$，其中 $\dot{\alpha}_t=\partial_t\alpha_t$、$\dot{\beta}_t=\partial_t\beta_t$ 分别表示对时间 $t$ 求导。将该式代入，条件流匹配损失：
+> \[
+> \mathcal{L}_{\mathrm{CFM}}(\theta)=\mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, x\sim \mathcal{N}(\alpha_t z,\beta_t^2 I_d)}\Big[\big\|u_t^\theta(x)-\big(\dot{\alpha}_t-\tfrac{\dot{\beta}_t}{\beta_t}\alpha_t\big)z-\tfrac{\dot{\beta}_t}{\beta_t}x\big\|^2\Big]\\
+> \overset{(i)}{=}\;
+> \mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, \epsilon\sim\mathcal{N}(0,I_d)}\Big[\big\|u_t^\theta(\alpha_t z+\beta_t\epsilon)-\big(\dot{\alpha}_t z+\dot{\beta}_t\epsilon\big)\big\|^2\Big]
+> \]
+> 
+> 注意 $\mathcal{L}_{\mathrm{CFM}}$ 的形式非常简单：采样样本点 $z$，再采样噪声点 $\epsilon$，然后一次均方误差即可。进一步地，有特殊情况 $\alpha_t=t$、$\beta_t=1-t$。此时对应的概率路径：
+> \[
+> p_t(x\mid z)=\mathcal{N}(tz,\,(1-t)^2)
+> \]
+> 
+> 称作（高斯）CondOT 概率路径。由于 $\dot{\alpha}_t=1$、$\dot{\beta}_t=-1$，从而：
+> \[
+> \mathcal{L}_{\mathrm{CFM}}(\theta)=\mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, \epsilon\sim\mathcal{N}(0,I_d)}\Big[\big\|u_t^\theta\!\big(tz+(1-t)\epsilon\big)-(z-\epsilon)\big\|^2\Big]
+> \]
+> ![alt text](flow-diffusion.assets/15.png)
+
+### 得分匹配
+已知边际得分 $\nabla \log p_t(x)=\int \nabla \log p_t(x\mid z)\;\frac{p_t(x\mid z)\,p_{\mathrm{data}}(z)}{p_t(x)}\,dz$，为了近似边际得分，令一个神经网络 $s_t^\theta$，称作**得分网络：**
+\[
+s_t^\theta:\mathbb{R}^d\times[0,1]\to \mathbb{R}^d.
+\]
+
+与之前类似，可以构造一个得分匹配损失和一个条件得分匹配损失，且依旧证得 $\mathcal{L}_{\mathrm{SM}}(\theta)=\mathcal{L}_{\mathrm{CSM}}(\theta)+C$：
+\[
+\mathcal{L}_{\mathrm{SM}}(\theta)=
+\mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, x\sim p_t(\cdot\mid z)}
+\Big[\big\|s_t^\theta(x)-\nabla \log p_t(x)\big\|^2\Big]\\
+\mathcal{L}_{\mathrm{CSM}}(\theta)=
+\mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, x\sim p_t(\cdot\mid z)}
+\Big[\big\|s_t^\theta(x)-\nabla \log p_t(x\mid z)\big\|^2\Big]
+\]
+
+> 依旧实例化在高斯情形 $p_t(x\mid z)=\mathcal{N}(\alpha_t z,\;\beta_t^2 I_d)$，条件得分 $\nabla \log p_t(x\mid z)=-\frac{x-\alpha_t z}{\beta_t^2}$，将该式代入，条件得分匹配损失可得：
+> \[
+> \mathcal{L}_{\mathrm{CSM}}(\theta)=
+> \mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, x\sim p_t(\cdot\mid z)}
+> \Big[\big\|s_t^\theta(x)+\tfrac{x-\alpha_t z}{\beta_t^2}\big\|^2\Big]\\
+> \overset{(i)}{=}\;\mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, \epsilon\sim\mathcal{N}(0,I_d)}\Big[\big\|s_t^\theta(\alpha_t z+\beta_t\epsilon)+\tfrac{\epsilon}{\beta_t}\big\|^2\Big]\\
+> =\mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, \epsilon\sim\mathcal{N}(0,I_d)}\Big[\frac{1}{\beta_t^2}\,\big\|\beta_t\, s_t^\theta(\alpha_t z+\beta_t\epsilon)+\epsilon\big\|^2\Big]
+> \]
+
+上述训练目标也称作**去噪得分匹配**，很快人们意识到，当 $\beta_t\approx 0$（噪声很小）时，上述损失由于含有因子 $1/\beta_t^2$，很不稳。所以，在早期的去噪扩散模型工作中，常去掉损失中的因子 $1/\beta_t^2$，引入**噪声预测网络** $\epsilon_t^\theta:\mathbb{R}^d\times[0,1]\to\mathbb{R}^d$：
+\[
+-\beta_t\, s_t^\theta(x)=\epsilon_t^\theta(x)
+\;\Longrightarrow\;
+\mathcal{L}_{\mathrm{DDPM}}(\theta)=
+\mathbb{E}_{t\sim\mathrm{Unif},\, z\sim p_{\mathrm{data}},\, \epsilon\sim\mathcal{N}(0,I_d)}
+\Big[
+\big\|\epsilon_t^\theta(\alpha_t z+\beta_t\epsilon)-\epsilon\big\|^2
+\Big]
+\]
+
+> 除了简洁性，高斯概率路径还有一个性质：可以由 $s_t^\theta$ 或 $\epsilon_t^\theta$，自动得到 $u_t^\theta$，反之也成立：
+> \[
+> u_t^{\mathrm{target}}(x\mid z)=\left(\beta_t^2\frac{\dot{\alpha}_t}{\alpha_t}-\beta_t\dot{\beta}_t\right)\nabla\log p_t(x\mid z)+\frac{\dot{\alpha}_t}{\alpha_t}\,x\\
+> u_t^{\mathrm{target}}(x)=\left(\beta_t^2\frac{\dot{\alpha}_t}{\alpha_t}-\beta_t\dot{\beta}_t\right)\nabla\log p_t(x)+\frac{\dot{\alpha}_t}{\alpha_t}\,x.
+> \]
+> 进一步可得如下恒等式：
+> \[
+> u_t^\theta=
+> \left(\beta_t^2\frac{\dot{\alpha}_t}{\alpha_t}-\beta_t\dot{\beta}_t\right)s_t^\theta(x)
+> +\frac{\dot{\alpha}_t}{\alpha_t}\,x\\
+> s_t^\theta(x)=
+> \frac{\alpha_t u_t^\theta(x)-\dot{\alpha}_t x}{\beta_t^2\dot{\alpha}_t-\alpha_t\beta_t\dot{\beta}_t}.
+> \]
+> 
+> ![alt text](flow-diffusion.assets/16.png)
 
 
