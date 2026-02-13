@@ -406,4 +406,117 @@ s_t^\theta:\mathbb{R}^d\times[0,1]\to \mathbb{R}^d.
 > 
 > ![alt text](flow-diffusion.assets/16.png)
 
+# 图像生成
+目前为止，模型仅简单地从 $p_{\text{data}}(z)$ 中返回样本，还不能结合 $prompt$ 来生成特定对象，所以本节目标即让模型可以从 $p_{\text{data}}(z\mid y)$ 中采样。而为了不和之前的条件概率路径等概念中的条件化搞混，将 $y$ 的条件化称作“引导”。
 
+## 原味引导
+令提示 $y$ 取值于某个空间 $\mathcal{Y}$。当 $y$ 对应文本提示时，$\mathcal{Y}$ 可以理解作所有文本提示的集合，那么**引导扩散模型**由两部分组成：扩散参数 $\sigma_t$ 和引导向量场 $u_t^\theta(\cdot\mid y)$：
+\[
+u^\theta:\mathbb{R}^d\times\mathcal{Y}\times[0,1]\to\mathbb{R}^d,\quad (x,y,t)\mapsto u_t^\theta(x\mid y)\\
+\sigma_t:[0,1]\to[0,\infty),\quad t\mapsto\sigma_t.
+\]
+
+额外将输入 $y\in\mathcal{Y}$ 作为条件，对任意的 $y$，从一个易采样的初始分布（如高斯分布），模拟上述 SDE 从 $t=0$ 演化到 $t=1$，让终点 $X_1$ 的分布尽可能符合 $p_{\text{data}}(\cdot\mid y)$。当 $\sigma_t\equiv 0$ 时，上述模型退化为**引导流模型**（仅含 ODE）；而当 $y$ 固定时，上述模型退化成非引导型：
+\[
+X_0\sim p_{\text{init}}\\
+dX_t=u_t^\theta(X_t\mid y)\,dt+\sigma_t\,dW_t,\qquad t\in[0,1]\\
+X_1\sim p_{\text{data}}(\,\cdot\mid y)
+\]
+
+如前所述，可以通过**条件流匹配**的目标来构造一个引导生成模型，即让一个引导向量场 $u_t^\theta(\cdot\mid y)$ 逼近某个（不依赖 $y$ 的）条件目标向量场 $u_t^{\mathrm{target}}(\cdot\mid z)$：
+\[
+\mathbb{E}_{\,z\sim p_{\mathrm{data}}(\cdot\mid y),\;x\sim p_t(\cdot\mid z)}
+\Big[\big\|u_t^\theta(x\mid y)-u_t^{\mathrm{target}}(x\mid z)\big\|^2\Big]
+\]
+
+对所有这样的 $y$ 选择进行边际化，得到一个**引导的条件流匹配目标**：
+\[
+\mathcal{L}_{\mathrm{CFM}}^{\mathrm{guided}}(\theta)
+=\mathbb{E}_{\,(z,y)\sim p_{\mathrm{data}}(z,y),\;t\sim\mathrm{Unif}[0,1],\;x\sim p_t(\cdot\mid z)}
+\Big[\big\|u_t^\theta(x\mid y)-u_t^{\mathrm{target}}(x\mid z)\big\|^2\Big]
+\]
+
+此时采样的 $(z,y)\sim p_{\mathrm{data}}$，而非仅采样 $z\sim p_{\mathrm{data}}$。
+
+## 无分类器引导
+由于来自万维网的“文本‑图像”对有很多错误或欠拟合，原味引导的结果往往不如意，为此必须人工强化 $y$，此技术称作**无分类器引导**。简单起见，后面仅关注高斯概率路径 $p_t(\cdot\mid z)=\mathcal{N}\!\left(\alpha_t z,\;\beta_t^2 I_d\right),\ \alpha_0=0,\ \beta_0=1;\alpha_1=1,\ \beta_1=0$ 的情况。
+
+1. 将引导向量场写成与**条件得分**相关的形式：
+\[
+u_t^{\mathrm{target}}(x\mid y)=a_t\,\nabla \log p_t(x\mid y)+b_t\,x
+\]
+
+2. $p_t(x\mid y)$ 以贝叶斯法则重写：
+\[
+p_t(x\mid y)=\frac{p_t(x)\,p_t(y\mid x)}{p_t(y)}
+\]
+
+3. 两侧同时对 $x$ 求导，则：
+\[
+\nabla \log p_t(x\mid y)
+=\nabla \log\!\left(\frac{p_t(x)\,p_t(y\mid x)}{p_t(y)}\right)
+=\nabla \log p_t(x)+\nabla \log p_t(y\mid x)
+\]
+因为 $p_t(y)$ 与 $x$ 无关，所以 $\nabla \log p_t(y)=0$。
+
+4. 将 (3) 代回 (1)，得到：
+\[
+u_t^{\mathrm{target}}(x\mid y)
+=b_t x+a_t\bigl(\nabla \log p_t(x)+\nabla \log p_t(y\mid x)\bigr)
+= u_t^{\mathrm{target}}(x)+a_t\,\nabla \log p_t(y\mid x)
+\]
+
+令无条件（不含 $y$）向量场 $u_t^{\mathrm{target}}(x)\ \triangleq\ a_t\,\nabla \log p_t(x)+b_t\,x$，那引导向量场就等于无引导向量场加上“ $prompt$ 似然”项 $\nabla \log p_t(y\mid x)$ 的贡献。通过 $w>1$，适当放大似然项即可得到**分类器引导**：
+\[
+\tilde u_t(x\mid y)=u_t^{\mathrm{target}}(x)+w\,a_t\,\nabla \log p_t(y\mid x)
+\]
+
+不过，上述分类器引导已被**无分类器引导**取代，故不再赘述。下面来推导无分类器引导的公式，由恒等式 $\nabla \log p_t(x\mid y)=\nabla \log p_t(x)+\nabla \log p_t(y\mid x)$ 和刚导出的分类器引导公式 $\tilde u_t(x\mid y)= u_t^{\mathrm{target}}(x)+w\,a_t\,\nabla \log p_t(y\mid x)$ 得：
+\[
+\tilde u_t(x\mid y)
+= u_t^{\mathrm{target}}(x)
++w\,a_t\bigl(\nabla \log p_t(x\mid y)-\nabla \log p_t(x)\bigr)
+\]
+
+将高斯概率路径下目标向量场代回：
+\[
+\begin{aligned}
+\tilde u_t(x\mid y)
+&= u_t^{\mathrm{target}}(x)
++w\,a_t\bigl(\nabla \log p_t(x\mid y)-\nabla \log p_t(x)\bigr)\\
+&= \bigl(a_t\nabla\log p_t(x)+b_t x\bigr)
++w\Bigl(\bigl(a_t\nabla\log p_t(x\mid y)+b_t x\bigr)-\bigl(a_t\nabla\log p_t(x)+b_t x\bigr)\Bigr)\\
+&=(1-w)\,u_t^{\mathrm{target}}(x)+w\,u_t^{\mathrm{target}}(x\mid y)
+\end{aligned}
+\]
+
+因此，放大后的引导向量场 $\tilde u_t(x\mid y)$ 可以视作**无引导向量场** $u_t^{\mathrm{target}}(x)$ 与**引导向量场** $u_t^{\mathrm{target}}(x\mid y)$ 的组合。为此，将一个无条件模型 $u_t^{\mathrm{target}}(x)$ 和一个条件模型 $u_t^{\mathrm{target}}(x\mid y)$ 推理时组合即可获得 $\tilde u_t(x\mid y)$。
+
+且可以在**同一个模型**中同时学到“有条件”和“无条件”的行为，即引入一个额外的空条件标记 $\varnothing$，表示条件缺失，视为无条件情形：
+\[
+u_t^{\mathrm{target}}(x)=u_t^{\mathrm{target}}(x\mid \varnothing)
+\]
+
+这样，一个条件网络 $u_t^\theta(x\mid y)$ 既可遇到 $y$，也能遇到 $\varnothing$。推理时，分别得到 $u_t^\theta(x\mid y),\ u_t^\theta(x\mid \varnothing)$，组合得到分类器无关引导（CFG）的迭代方向：
+\[
+u_{t,\mathrm{CFG}}^\theta(x\mid y)
+=(1-w)\,u_t^\theta(x\mid \varnothing)+w\,u_t^\theta(x\mid y)
+= u_t^\theta(x\mid \varnothing)+w\bigl(u_t^\theta(x\mid y)-u_t^\theta(x\mid \varnothing)\bigr)
+\]
+
+最终的得到 CFG 条件流匹配的损失如下：
+\[
+\mathcal{L}_{\mathrm{CFM}}^{\mathrm{CFG}}(\theta)
+= \mathbb{E}_{\square}\,\bigl\|u_t^{\theta}(x\mid y)-u_t^{\mathrm{target}}(x\mid z)\bigr\|^2 \\
+\square:\ (z,y)\sim p_{\mathrm{data}}(z,y),\quad
+t\sim \mathrm{Unif}[0,1],\quad
+x\sim p_t(\cdot\mid z),\quad
+\text{with prob. }\eta\ \text{replace } y=\varnothing
+\]
+
+![alt text](flow-diffusion.assets/17.png)
+
+# 模型
+[MIT 6.S184](https://www.youtube.com/watch?v=nfrZ30mnwP0&list=PL57nT7tSGAAUDnli1LhTOoCxlEPGS19vH&index=4)
+[An Introduction to Flow Matching and Diffusion Models](https://arxiv.org/abs/2506.02070)
+[3Blue1Brown](https://www.youtube.com/watch?v=iv-5mZ_9CPY&t=167s)
