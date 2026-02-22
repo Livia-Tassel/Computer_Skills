@@ -4,12 +4,6 @@
 
 [TOC]
 
-# A Survey on Efficient Inference for Large Language Models
-论文：https://arxiv.org/abs/2404.14294
-代码：无
-年份：2024.7.19
-核心：LLM 高效推理综述
-
 # ExCP: Extreme LLM Checkpoint Compression via Weight-Momentum Joint Shrinking
 论文：https://arxiv.org/abs/2406.11257
 代码：https://github.com/Gaffey/ExCP
@@ -267,4 +261,53 @@ $$L = L_{Read} + L_{Rep}$$
 
 3. **步骤 3：驱逐原始 KV**  
    驱逐步骤 1 的 $KV_{Read}$，仅保存 $KV_{Compressed}$，模型基于 $KV_{Compressed}$ 完成回答，回答过程中又得到新的 token，重复步骤 2-3。  
+
+# H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models
+论文：https://arxiv.org/abs/2306.14048
+代码：https://github.com/FMInference/H2O
+年份：2023.12.18
+核心：根据注意力分数驱逐 KV
+
+## 名词解释
+- 重击者（Heavy Hitters）：在模型生成过程中，被注意力长期反复“关注”的 token。
+- 注意力分数（Attention Score）：$i_{th}$ 个位置的 $Query$ 向量 $q_i$ 和 $j_{th}$ 个位置的 $Key$ 向量 $k_j$，未归一化的注意力分数 $s_{i,j} \;=\; \frac{q_i^\top k_j}{\sqrt{d_k}}$，本质两个 token 的相关性。
+
+## 核心方法
+![alt text](kvcache.assets/13.png)
+### 驱逐时机
+- **Prefill 阶段**：对 prompt 一次性并行计算，得到所有 prompt token 的 KV cache。
+- **Decode 阶段（逐 token 生成）**：每生成 1 个新 token 都新增一组 KV；当 KV cache 超过预算时，**就在该步结束后立刻驱逐**，为下一步生成腾出空间。
+
+### Recent + Heavy Hitters
+H2O 仅存储两类 token 的 KV：
+- **Recent tokens**：最近的 $r$ 个 token；
+- **Heavy hitters**：历史注意力分和最高的若干 token。
+
+令 $i_{th}$ 步（即生成 $i$ 个 token）结束后，cache 中存储的 token 下标集合 $S_i\subseteq [i],\ [i]=\{1,2,3,...,i\}$，固定容量：$|S_i|=k$。将 $i_{th}$ 步把新生成 token $i$ 加入候选后得到：
+  $$G_i = S_{i-1} \cup \{i\},\quad |G_i| = k+1.$$
+记 $i_{th}$ 步注意力（softmax 后）的相关性分配向量 $o_i$。在 H2O 中，**仅在可见集合上归一化**，不在候选集中的 token 注意力置 0：
+  $$o_i[j] = \frac{\exp(s_{i,j})}{\sum_{t\in S_{i-1}} \exp(s_{i,t})},\ j\in S_{i-1};\quad o_i[j]=0,\ j\notin S_{i-1}.$$
+
+其中 $s_{i,j}=\frac{q_i^\top k_j}{\sqrt{d_k}}$。
+
+下面通过计算来解释 H2O 驱逐向量的原理：令 $k=3$，Recent 窗口 $r=1$，Prefill prompt 有 3 个 token 下标：$1,2,3$。Prefill 结束后初始化：
+$$S_3=\{1,2,3\}$$
+
+token $t$ 的历史注意力分和等于 $H[t]$，初始：
+$$H[1]=H[2]=H[3]=0$$
+
+每个 decode step 生成新 token 时，可得到相关性分配向量 $o_i$（softmax 后），其反映了某个 token 和当前 token 的相关性，于是有如下公式：
+$$H[t]\leftarrow H[t] + o_i[t],\ t\in S_{i-1}$$
+
+然后由 $F_{\text{score}}(T)=\sum_{t\in T} H[t]$ 选出将驱逐的 KV，论文采取在可驱逐的候选中，踢掉 **$H[v]$ 最小** 的那个。
+
+现在 Step i=4，$S_3=\{1,2,3\}$，因此 $o_4$ 仅在 {1,2,3} 上归一化。假如模型在 i=4 步，得到如下注意力：$o_4[1]=0.70$，$o_4[2]=0.20$，$o_4[3]=0.10$。
+
+那么：$H[1]=0+0.70=0.70,\ H[2]=0+0.20=0.20,\ H[3]=0+0.10=0.10$。再**加入新 token 到候选集合**：$G_4=S_3\cup\{4\}=\{1,2,3,4\}$，并令 $H[4]=0$。
+
+由于 $r=1$，token 4 最新 token，**不可驱逐**。选择当前 $H[i]$ 最低的 3 踢掉，得到：$S_4=G_4\setminus\{3\}=\{1,2,4\}$。如果出现注意力分相同的，可以配合 LRU 选择最佳驱逐对象。
+
+
+
+
 
