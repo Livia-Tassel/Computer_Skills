@@ -51,8 +51,8 @@ r_w = \frac{\alpha}{\sqrt{m_t}} \times \text{median}(W) = \frac{5e-5}{0.02} \tim
   - 原理：动量与权重强关联，权重被剪枝的位置，其动量对后续训练的作用也可忽略，因此同步剪枝可进一步减少冗余。
 
 ### 非均匀量化（Non-uniform quantization）
-- **操作**：对剪枝后的残差权重和动量，用**K-means聚类**将数值分为若干“聚类中心”（如示例中的 $0, 2.3, 3.5$ 等），然后存储 “聚类中心 $C_t$” 和 “聚类索引 $\mathcal{I}_t$”。
-- **原理**：多个相似的数值可以共享同一个聚类中心，只存储索引即可还原原始数值。
+- **操作**：对剪枝后的残差权重和动量，用**K-means聚类**将数值分为若干“聚类中心”（如示例中的 $0, 2.3, 3.5$ 等），然后存储 “聚类中心 $C_t$” 和 “聚类下标 $\mathcal{I}_t$”。
+- **原理**：多个相似的数值可以共享同一个聚类中心，只存储下标即可还原原始数值。
 
 经过上述三步处理后，再用压缩算法（如7zip）打包，得到**体积极小的压缩检查点（Compressed Checkpoints）**，同时能保证模型训练的 “近无损恢复”。
 
@@ -136,7 +136,7 @@ r_w = \frac{\alpha}{\sqrt{m_t}} \times \text{median}(W) = \frac{5e-5}{0.02} \tim
 
 ### 自适应流传输（Adaptive Streaming）
 - **操作**：根据实时带宽动态适应传输内容，在 CacheGen 中将上下文拆分为多个上下文块（论文中以 1.5k token 作为默认块长），每个块都压缩不同精度的版本，传输时根据实时带宽选择最合适版本，如带宽极差时，则直接传输原始上下文予 CPU 重新计算。
-- **原理**：压缩方法即张量量化 → 聚类（存储索引）→ 按 “Layer + Channel” 分组得到序列，如 [1, 2, 0, 1] → [转比特流](https://zhuanlan.zhihu.com/p/390684936)。
+- **原理**：压缩方法即张量量化 → 聚类（存储下标）→ 按 “Layer + Channel” 分组得到序列，如 [1, 2, 0, 1] → [转比特流](https://zhuanlan.zhihu.com/p/390684936)。
 
 # GEAR: An Efficient KV Cache Compression Recipe for Near-Lossless Generative Inference of LLM
 论文：https://arxiv.org/html/2403.05527
@@ -266,7 +266,7 @@ $$L = L_{Read} + L_{Rep}$$
 论文：https://arxiv.org/abs/2306.14048
 代码：https://github.com/FMInference/H2O
 年份：2023.12.18
-核心：根据注意力分数驱逐 KV
+核心：驱逐注意力得分最低的 KV
 
 ## 名词解释
 - 重击者（Heavy Hitters）：在模型生成过程中，被注意力长期反复“关注”的 token。
@@ -306,6 +306,124 @@ $$H[t]\leftarrow H[t] + o_i[t],\ t\in S_{i-1}$$
 那么：$H[1]=0+0.70=0.70,\ H[2]=0+0.20=0.20,\ H[3]=0+0.10=0.10$。再**加入新 token 到候选集合**：$G_4=S_3\cup\{4\}=\{1,2,3,4\}$，并令 $H[4]=0$。
 
 由于 $r=1$，token 4 最新 token，**不可驱逐**。选择当前 $H[i]$ 最低的 3 踢掉，得到：$S_4=G_4\setminus\{3\}=\{1,2,4\}$。如果出现注意力分相同的，可以配合 LRU 选择最佳驱逐对象。
+
+# ChunkKV: Semantic-Preserving KV Cache Compression for Efficient Long-Context LLM Inference 
+论文：https://arxiv.org/abs/2502.00299
+代码：https://github.com/NVIDIA/kvpress
+年份：2025.10.14
+核心：以语义块为单位压缩、裁剪 KV
+
+## 名词解释
+- 语义块（Semantic Chunk）：将一段含有关联语义的 token 作为一个整体，例如 “主+动+宾” 的短片段，压缩时保留最有信息量的 chunk。
+- 观察窗口（Observation Window）：在正式压缩前，先观察最近一段 query 对历史 KV 的注意力分布，用它估计历史内容的重要性。
+
+## 核心方法
+### 步骤 1：语义局部性切分 Chunk
+假设历史 prompt 被分词后得到 12 个 token：
+$$[t_1,t_2,t_3,t_4,\ t_5,t_6,t_7,t_8,\ t_9,t_{10},t_{11},t_{12}]$$
+
+令块大小等于 4，则可切成 3 个 chunk：
+$$C_1=[t_1,t_2,t_3,t_4],\quad C_2=[t_5,t_6,t_7,t_8],\quad C_3=[t_9,t_{10},t_{11},t_{12}]$$
+
+分块后可能分别对应：
+- \(C_1\)：`The cat sat on`
+- \(C_2\)：`the red mat near`
+- \(C_3\)：`the sunny window today`
+
+### 步骤 2：观察窗口统计 token 注意力贡献
+取最近一段 query token 作为观察窗口，统计它们对历史 token 的注意力分布。如果最近生成的内容频繁关注某段历史 token，那么那一段在后面的生成中可能也很重要。
+
+令观察窗口里有 2 个 query：\(q_1,q_2\)，历史一共 8 个 token：
+\[
+[t_1,t_2,t_3,t_4,t_5,t_6,t_7,t_8]
+\]
+
+如果模型得到的注意力和（不区分 head）等于：
+\[
+A=[0.05,0.08,0.32,0.30,0.04,0.06,0.10,0.05]
+\]
+
+即最近 query 比较关注 \(t_3,t_4\)，其次 \(t_7\)。
+
+### 步骤 3：将 token 聚合成 Chunk Score 并执行 Top-K
+对 chunk 内部 token 的注意力贡献求和或求平均，得到 chunk 级注意力贡献。上述两块的 chunk score 可写为：
+\[
+S(C_1)=0.05+0.08+0.32+0.30=0.75 \\
+S(C_2)=0.04+0.06+0.10+0.05=0.25
+\]
+
+如果驱逐一个块，那么将驱逐 \(C_2\) 块。
+
+### 步骤 4：下标复用（Layer-wise Index Reuse）
+在某一层选出 Top-K chunk 后，后面几层不再从头计算，而是复用这些 chunk 的下标，或只做少量修正。因为它们通常会共同关注相近的语义区域。
+
+# ClusterKV: Manipulating LLM KV Cache in Semantic Space for Recallable Compression
+论文：https://arxiv.org/abs/2412.03213
+代码：https://github.com/sjtu-zhao-lab/ClusterKV
+年份：2025.6.14
+核心：在语义空间中聚类 KV，可回溯压缩
+
+## 名词解释
+- 可回溯压缩（Recallable Compression）：把大量 KV 放到 CPU 等低速存储中，解码时再 “召回” 一部分真正重要的 token 回到 GPU 参与注意力计算。
+- 语义簇（Semantic Cluster）：在 key 向量空间中（方向）靠近的一组 token。语义相近的 token 往往有相近的注意力权重，因此可以以 “簇” 而不是以 “位置页” 来召回。
+- 聚类中心（Centroid）：一个语义簇的代表向量，通常由簇内 key 向量求均值得到。解码时先用 query 和这些中心进行点积，优先召回分高的簇。
+- 注意力汇（Attention Sink）：一般指最开头的一小段 token，它们通常在未来很长一段时间都受到关注，且在聚类中常表现为离群点，因此不参与普通聚类。
+
+## 核心方法
+![alt text](kvcache.assets/14.png)
+把 key 向量在语义空间里聚成若干簇；解码时不再在全部 token 上算注意力贡献，而以簇为单位得到哪些**簇中心**靠近当前 query，再把这些簇里的 token 全部召回。
+
+### 步骤 1：Prefill 后在 key 空间做语义聚类
+在 prefill 结束后，对 prompt token 的 key 向量做 K-means 聚类（余弦相似性衡量距离）；前 16 个 attention sink 默认保留，不参与普通聚类。
+
+![alt text](kvcache.assets/15.png)
+如果历史中有 8 个 token，它们对应的 key 向量在语义空间里自然分成 3 团：
+- Cluster 0：`Paris`, `France`, `capital`
+- Cluster 1：`Curie`, `Nobel`, `Physics`
+- Cluster 2：`apple`, `banana`
+
+那么 K-means 后可以得到 3 个簇：
+\[
+\mathcal{C}_0=\{t_1,t_2,t_3\},\quad
+\mathcal{C}_1=\{t_4,t_5,t_6\},\quad
+\mathcal{C}_2=\{t_7,t_8\}
+\]
+
+并得到 3 个簇中心：$\mu_0,\mu_1,\mu_2$。
+
+### 步骤 2：对簇中心算注意力分
+当前解码步得到 query \(q\) 后，与各个簇中心 \(\mu_i\) 进行点积，得到注意力分；然后按得分从大到小排序簇。
+
+比如当前问题：`What is the capital of France?`。那么当前 query 和 3 个簇中心的点积可能是：
+$$q^\top\mu_0 = 0.92,\quad q^\top\mu_1 = 0.21,\quad q^\top\mu_2 = 0.05$$
+
+说明当前 query 明显关心 Cluster 0，对 Curie/Nobel 那一团就不太关心。
+
+### 步骤 3：按簇顺序召回 token
+把簇排序后，逐个把对应簇里的 token 取出来，直到 GPU 上的 KV 达到预算上限；如果最后一个簇超预算，就对最后一个簇做裁剪。
+
+值得注意，同一个簇中 token 的下标可能离散，所以召回时要借助前缀和快速选中对应 token。
+
+假如 5 个 token 的簇标签是：$[2,0,2,1,1]$。即 \(t_1,t_3\) 归 Cluster 2，\(t_2\) 归 Cluster 0，\(t_4,t_5\) 归 Cluster 1。
+
+以簇标签排序后得到下标：$[2,4,5,1,3]$，簇大小是：$[1,2,2]$，前缀和是：$[1,3,5]$。如果当前选中 Cluster 0 和 Cluster 1，那根据前缀和就能立刻得到：
+- Cluster 0 对应排序区间 `[1,1]`
+- Cluster 1 对应排序区间 `[2,3]`
+
+自然也能快速得到 token 下标：$[t_2,t_4,t_5]$。
+
+### 步骤 4：解码中新生成 token 再聚类
+对于解码阶段新生成的 token，并非每一步都和 prefill token 混在一起做全局聚类，而**隔若干 decoding steps**，对新生成的 token 做一次局部聚类，形成新簇与新中心。
+
+# SentenceKV: Efficient LLM Inference via Sentence-Level Semantic KV Caching
+论文：https://arxiv.org/abs/2504.00970
+代码：https://github.com/zzbright1998/SentenceKV
+年份：2025.9.29
+核心：
+
+
+
+
 
 
 
