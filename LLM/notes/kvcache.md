@@ -419,13 +419,117 @@ $$q^\top\mu_0 = 0.92,\quad q^\top\mu_1 = 0.21,\quad q^\top\mu_2 = 0.05$$
 论文：https://arxiv.org/abs/2504.00970
 代码：https://github.com/zzbright1998/SentenceKV
 年份：2025.9.29
-核心：
+核心：以句子为语义单位管理 KV
 
+## 名词解释
+- 句子桶（Sentence Bucket）：将历史上下文以句号、问号等自然语言边界切成若干句子，每个句子看作一个语义桶。
+- 句子语义向量（Sentence Semantic Vector）：对某个句子中被选择的 token 的 key 向量求平均，得到该句子的语义中心。
 
+## 核心方法
+![alt text](kvcache.assets/16.png)
 
+### 步骤 1：切分句子桶
+假如历史 prompt 有下面三句话：
+- $C_1$：`Paris is the capital of France.`
+- $C_2$：`Marie Curie won the Nobel Prize in Physics.`
+- $C_3$：`Bananas are rich in potassium.`
 
+SentenceKV 先依标点切分成 3 个句子桶：
+\[
+C_1=[t_1,t_2,t_3,t_4,t_5,t_6],\quad
+C_2=[t_7,t_8,t_9,t_{10},t_{11},t_{12},t_{13},t_{14}],\quad
+C_3=[t_{15},t_{16},t_{17},t_{18},t_{19}]
+\]
 
+### 步骤 2：观察窗口中给历史 token 打注意力分
 
+Prefill 阶段取 prompt 末尾的一小段 token 作为观察窗口，统计这些 token 对历史所有 token 的注意力贡献。假如观察窗口长 2，它们（$t_{18},t_{19}$）对其前面的历史 token 的注意力分聚合如下：
 
+\[
+score(t_j)=\sum_{q\in \text{Obs}} \text{Attn}(q,t_j)
+\]
 
+- $\text{Obs}$ 表示 observation window 中的 query token 集合；
+- $\text{Attn}(q,t_j)$ 表示 query $q$ 对历史 token $t_j$ 的注意力。
 
+### 步骤 3：句子内部选择 token
+SentenceKV 并非 “句子一旦入选就选择全部 token”，而仅将句子作为召回单位，句子内部仍然仅选择注意力分高的 token。假设最终 GPU 预算 $B=4$，令 $\alpha=2$，则 Prefill 阶段先选择：$B' = \alpha B = 2 \times 4 = 8$ 个 token。
+
+比如选择：
+- $C_1$：`Paris`, `capital`, `France`
+- $C_2$：`Curie`, `Nobel`, `Physics`
+- $C_3$：`Bananas`, `potassium`
+
+### 步骤 4：构建句子语义向量
+对每个句子桶中被选择 token 的 key 向量求平均，得到该句子的语义中心。设句子 $C_i$ 中被选择 token 的下标集合为 $I_i$，$h_{th}$ 个注意力头上 $t_{th}$ 个 token 的 key 向量为 $k_t^{(h)}$，则 $h_{th}$ 个头上的句子语义向量：
+\[
+\mu_i^{(h)} = \frac{1}{|I_i|}\sum_{t\in I_i} k_t^{(h)}
+\]
+
+比如对句子 $C_1=$ `Paris is the capital of France.`，选择了 3 个 token：
+\[
+I_1=\{\text{Paris},\ \text{capital},\ \text{France}\}
+\]
+
+令某个 head 上它们的 key 向量如下：
+\[
+k_1=[1,0],\quad k_2=[0,2],\quad k_3=[2,2]
+\]
+
+那么该头上该句子的平均 key 向量：$\mu_1 = \frac{1}{3}([1,0]+[0,2]+[2,2]) = [1,\tfrac{4}{3}]$。$\mu_i$ 非常小，可以常驻 GPU；而真正占显存的 token 级 KV 则存放到 CPU。
+
+### 步骤 5：解码时 query 句子语义向量
+到了 Decode 阶段，SentenceKV 不把当前这个 token 的 query 查询历史句子，而把**当前正在生成的这一句话**中所有已经得到的 query 暂存，取均值 $\bar{q}$ 来查询并召回历史句子。比如当前模型正在生成：`The capital of France is ...`。
+
+当前生成的 3 个 token 对应的 query 向量如下：
+\[
+q_1=[1,1],\quad q_2=[2,1],\quad q_3=[1,2]
+\]
+
+那么 平均 query $\bar{q}$：
+\[
+\bar{q} = \frac{q_1+q_2+q_3}{3}
+= \frac{[1,1]+[2,1]+[1,2]}{3}
+= [\tfrac{4}{3},\tfrac{4}{3}]
+\]
+
+将 $\bar q$ 与历史句子的语义向量 $\mu_i$ 进行点积 $score(C_i)=\bar q^\top \mu_i$：
+\[
+\bar q=[\tfrac{4}{3},\tfrac{4}{3}],\quad
+\mu_1=[1,\tfrac{4}{3}],\quad
+\mu_2=[0.2,0.4],\quad
+\mu_3=[0.1,0.0]
+\]
+
+则：
+\[
+score(C_1)=\bar q^\top \mu_1
+=\tfrac{4}{3}\cdot1+\tfrac{4}{3}\cdot\tfrac{4}{3}
+=\tfrac{4}{3}+\tfrac{16}{9}
+=\tfrac{28}{9}\approx 3.11
+\]
+
+\[
+score(C_2)=\bar q^\top \mu_2
+=\tfrac{4}{3}\cdot0.2+\tfrac{4}{3}\cdot0.4
+=0.8
+\]
+
+\[
+score(C_3)=\bar q^\top \mu_3
+=\tfrac{4}{3}\cdot0.1+\tfrac{4}{3}\cdot0
+\approx 0.13
+\]
+
+因此有：
+\[
+score(C_1) > score(C_2) > score(C_3)
+\]
+
+然后，SentenceKV 依句子分从高到低（$C_1 > C_2 > C_3$），依次把对应句子中的选择 token 的 KV 从 CPU 召回，直到达到 GPU token 预算 $B$。
+
+- $C_1$：`Paris`, `capital`, `France`（3 个）
+- $C_2$：`Curie`, `Nobel`, `Physics`（3 个）
+- $C_3$：`Bananas`, `potassium`（2 个）
+
+所以先召回 $C_1$ 的 3 个 token；预算还剩 1 个，再从 $C_2$ 中取 1 个最相关 token。最终 GPU 中参与注意力的历史 token 可能：$\{\text{Paris},\ \text{capital},\ \text{France},\ \text{Physics}\}$。
