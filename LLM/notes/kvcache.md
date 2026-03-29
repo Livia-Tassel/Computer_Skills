@@ -419,7 +419,7 @@ $$q^\top\mu_0 = 0.92,\quad q^\top\mu_1 = 0.21,\quad q^\top\mu_2 = 0.05$$
 论文：https://arxiv.org/abs/2504.00970
 代码：https://github.com/zzbright1998/SentenceKV
 年份：2025.9.29
-核心：以句子为语义单位管理 KV
+核心：以句子划分语义单位来管理 KV
 
 ## 名词解释
 - 句子桶（Sentence Bucket）：将历史上下文以句号、问号等自然语言边界切成若干句子，每个句子看作一个语义桶。
@@ -533,3 +533,100 @@ score(C_1) > score(C_2) > score(C_3)
 - $C_3$：`Bananas`, `potassium`（2 个）
 
 所以先召回 $C_1$ 的 3 个 token；预算还剩 1 个，再从 $C_2$ 中取 1 个最相关 token。最终 GPU 中参与注意力的历史 token 可能：$\{\text{Paris},\ \text{capital},\ \text{France},\ \text{Physics}\}$。
+
+# R-KV: Redundancy-aware KV Cache Compression for Reasoning Models
+论文：https://arxiv.org/abs/2505.24133
+代码：https://github.com/Zefan-Cai/R-KV
+年份：2026.1.22
+核心：
+
+## 名词解释
+- 推理模型（Reasoning Model）：显式长链式思考（Chain-of-Thought, CoT）的模型，“反思、回看、修正”，因此输出 token 极长。
+- 解码期压缩（Decoding-time Compression）：不在 Prefill 阶段压 prompt，而在模型一边生成一边压缩 KV Cache。因为推理模型真正让显存爆炸的是 “思维过程”。
+- 冗余分（Redundancy Score）：某个 token 的 key 向量与其他 token 的 key 向量有多相似。越相似，即它表达的信息越可能已经被别的 token 覆盖。
+- 组查询注意力（Grouped-Query Attention, GQA）：多个 query head 共享同一组 key/value head 的注意力结构。R-KV 也给其设计了 importance 估计方法。
+
+## 核心方法
+![alt text](kvcache.assets/17.png)
+### 步骤 1：解码阶段分块压缩 KV Cache
+R-KV 并非生成 1 个 token 就压缩一次，而先让模型生成一小段 token，放入 buffer；等 buffer 满了，再把旧 cache 中的 token 和当前 buffer 中前面部分 token 组成候选集合，然后统一做一次筛选。与此同时，buffer 末尾最近的一些 token 当做 observation tokens，不参与这一轮普通驱逐。
+
+假如 observation tokens 大小等于 2，旧 cache 里有 5 个 token：
+\[
+C = [t_1,t_2,t_3,t_4,t_5]
+\]
+
+新生成 buffer 有 4 个 token：
+\[
+B = [t_6,t_7,t_8,t_9]
+\]
+
+则最后 2 个 \(t_8,t_9\) 当做 observation tokens；参与筛选的候选集合如下：
+\[
+G = [t_1,t_2,t_3,t_4,t_5,t_6,t_7]
+\]
+
+R-KV 将从这 7 个候选里挑出 4 个（超参），和 observation tokens \(t_8,t_9\) 组成新的 cache。
+
+### 步骤 2：observation tokens 得出注意力贡献
+R-KV 认同 SnapKV 的直觉：**如果一个历史 token 被最近 query 高频关注，它大概率后面也将被长期关注**。目前 observation tokens 是 \(t_8,t_9\)，它们对候选 token \([t_1,\dots,t_7]\) 的某个 head 上的注意力（已做归一化）分别为：
+\[
+a_{t_8} = [0.05, 0.08, 0.30, 0.12, 0.10, 0.20, 0.15] \\
+a_{t_9} = [0.04, 0.06, 0.28, 0.10, 0.11, 0.24, 0.17]
+\]
+
+把来自 observation queries 的注意力做聚合：
+\[
+I = [0.09, 0.14, 0.58, 0.22, 0.21, 0.44, 0.32]
+\]
+
+如果尽靠注意力，最想选择的可能是：\(t_3,t_6,t_7\) 等 token。
+
+### 步骤 3：key 向量余弦相似得到冗余分
+但问题在于：**高注意力不等于不冗余**。推理模型里，很多 “再想一遍”、“因此...” 这类 token 互相很像。R-KV 对同一 head 内的 key 向量做 L2 归一化，然后可得到 token 两两之间的余弦相似矩阵，再以行做聚合：
+
+\[
+M =
+\begin{pmatrix}
+1.00 & 0.06 & 0.12 & 0.08 & 0.10 & 0.16 & 0.08 \\
+0.06 & 1.00 & 0.20 & 0.18 & 0.14 & 0.24 & 0.26 \\
+0.12 & 0.20 & 1.00 & 0.62 & 0.68 & 0.84 & 0.86 \\
+0.08 & 0.18 & 0.62 & 1.00 & 0.16 & 0.20 & 0.14 \\
+0.10 & 0.14 & 0.68 & 0.16 & 1.00 & 0.18 & 0.16 \\
+0.16 & 0.24 & 0.84 & 0.20 & 0.18 & 1.00 & 0.78 \\
+0.08 & 0.26 & 0.86 & 0.14 & 0.16 & 0.78 & 1.00
+\end{pmatrix}
+\]
+
+\[
+\bar r_i = \frac{1}{N-1}\sum_{j\ne i} M_{ij},\quad N=7
+\]
+
+假如最终聚合后得到：
+\[
+\bar{r} = [0.10, 0.18, 0.72, 0.20, 0.16, 0.70, 0.68]
+\]
+
+即 \(t_3,t_6,t_7\) 与其他 token 都很相似，它们可能属于同一段冗余推理；对上式做 softmax，得到冗余分：
+\[
+R \approx [0.109, 0.118, 0.204, 0.120, 0.115, 0.200, 0.196]
+\]
+
+### 步骤 4：近期相似 token 特殊选择
+R-KV 在剔除冗余时，对 “最近若干个高相似 token” 做豁免，比如 \(t_3\) 与 \(t_6,t_7\) 都很相似，且规定 “仅能选择 1 个相似 token”，那么对 \(t_3\) 而言，\(t_7\) 因为最近，可不计入它的冗余惩罚。
+
+### 步骤 5：联合 “注意力 - 冗余” 打分
+R-KV 联合打分：$S_i = I_i - \lambda R_i$，\(I_i\)：token 的注意力分；\(R_i\)：token 的冗余分。
+
+假如 $I = [0.09, 0.14, 0.58, 0.22, 0.21, 0.44, 0.32]$，$R = [0.109, 0.118, 0.204, 0.120, 0.115, 0.200, 0.196]$，则联合得分：
+\[
+S = I - R
+= [-0.019, 0.022, 0.376, 0.100, 0.095, 0.240, 0.124]
+\]
+
+得分从高到低排序：
+\[
+t_3 > t_6 > t_7 > t_4 > t_5 > t_2 > t_1
+\]
+
+由于本轮候选仅能选择 4 个，因此选出：$\{t_3,t_6,t_7,t_4\}$，再加上 observation tokens：$\{t_3,t_6,t_7,t_4,t_8,t_9\}$，即压缩后的新 KV cache。
