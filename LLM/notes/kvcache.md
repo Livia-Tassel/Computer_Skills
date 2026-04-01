@@ -170,7 +170,7 @@ $$\min_{\hat{D}, L, S} \|X - \hat{D} - L - S\|_F$$
 2. 低秩逼近：对每个 $R_h$，通过**幂迭代算法**（高效 SVD 近似）得到 top-$r$ 奇异值与向量，构建低秩矩阵 $L_h = A_h B_h^\top$（$A_h \in \mathbb{R}^{n \times r}$，$B_h \in \mathbb{R}^{d_H \times r}$），最终拼接为 $L = \text{Concat}(L_1, ..., L_H)$；
 3. 秩选择：论文中 $r=4$（prefill 阶段）/$r=2$（解码阶段），此时 $L$ 的内存开销仅为原始 $X$ 的 $\frac{r}{d} \approx 3.125\%$（$d=128$ 时）。
 
-### 步骤 3：误差融合与重建
+### 步骤 3：误差融合与重构
 - **最终压缩张量**：$\hat{X} = \hat{D} + L + S$，满足 $\|X - \hat{X}\|_F \ll \|X - \hat{D}\|_F$（量化误差降低 80% 以上）；
 - **流缓冲优化**：引入大小为 $n_b=20$ 的缓冲区，每生成 $n_b$ 个 token 批量执行上述压缩，比逐令牌压缩延迟降低 40%。
 
@@ -183,7 +183,7 @@ $$\min_{\hat{D}, L, S} \|X - \hat{D} - L - S\|_F$$
 </table>
 
 ## IDEAL
-流版 Bitwise Gear 完全保留原版 Gear “拆分易压/难压部分 → 分模块处理 → 协同重建” 的分治逻辑，但针对 MNN 端侧 **CPU 算力有限、内存/存储资源紧张、精度要求 100% 无损**的特性，将原版 “量化 + SVD 低秩” 的有损算子，改为**位操作 + 流式无损压缩**的硬件友好型算子，最终实现 “Bit-exact 无损压缩” 与 “端侧无感推理” 的双重目标。
+流版 Bitwise Gear 完全保留原版 Gear “拆分易压/难压部分 → 分模块处理 → 协同重构” 的分治逻辑，但针对 MNN 端侧 **CPU 算力有限、内存/存储资源紧张、精度要求 100% 无损**的特性，将原版 “量化 + SVD 低秩” 的有损算子，改为**位操作 + 流式无损压缩**的硬件友好型算子，最终实现 “Bit-exact 无损压缩” 与 “端侧无感推理” 的双重目标。
 
 ### 步骤 1：Base 流提取 —— 高低位拆分
 FP16 由 “1 位符号 + 5 位指数 + 10 位尾数” 构成：
@@ -199,9 +199,9 @@ FP16 由 “1 位符号 + 5 位指数 + 10 位尾数” 构成：
 
 **双流并行压缩**：为 Base 流和 Residual 流分别创建独立的 Zstd 流上下文，Base 流压缩比可达 5× 以上；Residual 流压缩比可达 1.2×~1.5×，最后将两个流的压缩结果封装为 “双流压缩块”。
 
-### 步骤3：流式缓冲与无损重建
+### 步骤3：流式缓冲与无损重构
 #### ① 压缩阶段：4KB Page Buffer批量处理
-#### ② 解压重建阶段：预取 + NEON 快速拼接
+#### ② 解压重构阶段：预取 + NEON 快速拼接
 
 # LoMA: Lossless Compressed Memory Attention
 论文：https://ar5iv.labs.arxiv.org/html/2401.09486
@@ -538,7 +538,7 @@ score(C_1) > score(C_2) > score(C_3)
 论文：https://arxiv.org/abs/2505.24133
 代码：https://github.com/Zefan-Cai/R-KV
 年份：2026.1.22
-核心：
+核心：强推理场景的 kv 冗余驱逐
 
 ## 名词解释
 - 推理模型（Reasoning Model）：显式长链式思考（Chain-of-Thought, CoT）的模型，“反思、回看、修正”，因此输出 token 极长。
@@ -630,3 +630,48 @@ t_3 > t_6 > t_7 > t_4 > t_5 > t_2 > t_1
 \]
 
 由于本轮候选仅能选择 4 个，因此选出：$\{t_3,t_6,t_7,t_4\}$，再加上 observation tokens：$\{t_3,t_6,t_7,t_4,t_8,t_9\}$，即压缩后的新 KV cache。
+
+# KVzip: Query-Agnostic KV Cache Compression with Context Reconstruction
+论文：https://arxiv.org/abs/2505.23416
+代码：https://github.com/snu-mllab/KVzip
+年份：2025.9.30
+核心：面向多查询场景的 query-agnostic KV Cache 压缩
+
+## 名词解释
+- Query-agnostic（查询无关）压缩：压缩时**不依赖某个具体问题**，而尽量选择 “无论后面问什么都大概率有用” 的上下文信息。这样同一份压缩后的 KV cache 可以被多个 query 复用。
+- 上下文重构（Context Reconstruction）：让模型从压缩前的上下文 KV 把原上下文 “复述（还原）” 出来。
+- 最大交叉注意力分（Maximum Cross-Attention Score）：在 “重构上下文” 这轮 forward 中，某个历史 KV 被所有 query 位置、所有 grouped query 看到的最大 attention 值。
+- Pair-level Eviction：对**每个 token 的每个 head 上的 KV 对**单独打分、单独驱逐。
+
+## 核心方法
+![alt text](kvcache.assets/18.png)
+### 步骤 1：正常 prefill，拿到原始上下文 KV cache
+假如上下文有 6 个 token：$C=[t_1,t_2,t_3,t_4,t_5,t_6]$。prefill 后，模型得到这 6 个 token 在每个 layer、每个 head 上的 KV Cache。为了讲原理，先聚焦 **某一 layer、某一个 head**。
+
+### 步骤 2：构造 “还原原文” 输入，模拟上下文重构
+KVzip 构造一个提示词：$P = [\texttt{Repeat the previous context:}]$，再把 “提示词 + 原始上下文” 拼起来作为输入：
+\[
+X = [P; t_1,t_2,t_3,t_4,t_5,t_6]
+\]
+
+此时，key/value 里既有当前 forward 内部的 token，也有先前 prefill 好的上下文 KV；如果某个旧 token 的 KV 在 “还原原文” 时被强烈关注，说明它像压缩包里的 “核心信息块”，值得选择。
+
+### 步骤 3：用最大交叉注意力给每个 KV 打重要性分
+假如本 head 上，输入一共有 4 个 query 位置明显回看旧上下文，于是切出来的交叉注意力矩阵可以写成：
+\[
+\bar A=
+\begin{pmatrix}
+0.10 & 0.05 & 0.30 & 0.25 & 0.20 & 0.10 \\
+0.08 & 0.04 & 0.35 & 0.20 & 0.22 & 0.11 \\
+0.06 & 0.03 & 0.40 & 0.18 & 0.21 & 0.12 \\
+0.05 & 0.02 & 0.38 & 0.17 & 0.24 & 0.14
+\end{pmatrix}
+\]
+
+- 行：上下文重构过程中的 query 位置；
+- 列：旧上下文中的 6 个 token \(t_1\sim t_6\)。
+
+KVzip 对每一列取最大值，即 $S_{l,h}[j] = \max_{g,i} \bar A_{l,h}[g,i,j]$，得到该 head 上每个 token 的注意力分：$S = [0.10,0.05,0.40,0.25,0.24,0.14]$。即**如果个 token 在某个 query 位置被强烈关注过一次，KVzip 就认为它 “可能值得选择”。**
+
+### 步骤 4：驱逐低分 KV
+Top-K 法，所以不再赘述，但它和 SnapKV / PyramidKV 的根本区别在于：后者问的是 “**当前问题**最关心谁”；而KVzip 问的是 “**想把原文重新还原出来**时最离不开谁”。所以 KVzip 适合 “一份上下文，后面很多不同 query” 的场景。
