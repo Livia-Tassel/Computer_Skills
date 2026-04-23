@@ -675,3 +675,9 @@ KVzip 对每一列取最大值，即 $S_{l,h}[j] = \max_{g,i} \bar A_{l,h}[g,i,j
 
 ### 步骤 4：驱逐低分 KV
 Top-K 法，所以不再赘述，但它和 SnapKV / PyramidKV 的根本区别在于：后者问的是 “**当前问题**最关心谁”；而KVzip 问的是 “**想把原文重新还原出来**时最离不开谁”。所以 KVzip 适合 “一份上下文，后面很多不同 query” 的场景。
+
+# LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference
+论文：https://arxiv.org/abs/2510.09665
+代码：https://github.com/LMCache/LMCache
+年份：2025.12.5
+
