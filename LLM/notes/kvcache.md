@@ -681,3 +681,111 @@ Top-K 法，所以不再赘述，但它和 SnapKV / PyramidKV 的根本区别在
 代码：https://github.com/LMCache/LMCache
 年份：2025.12.5
 
+# Swarm: Co-Activation Aware KVCache Offloading Across Multiple SSDs
+论文：https://arxiv.org/abs/2603.17803
+代码：无
+年份：2026.3.18
+核心：KV Cache 共激活规律；多 SSD 并行 I/O
+
+## 名词解释
+- 共激活（Co-Activation）：如果某个 KV entry 被当前 query 选中，而某一批 KV entry 也通常同时选中，那么它们之间存在共激活。
+
+## 核心方法
+![alt text](kvcache.assets/19.png)
+### 步骤 1：离线得到共激活矩阵
+假设某一 Layer 中有 6 个历史 KV entry：
+\[
+E=\{e_1,e_2,e_3,e_4,e_5,e_6\}
+\]
+
+让一批 profiling query 跑推理，得到每两个 entry 同时被选中的概率。假设一共观察了 100 次 query，得到共激活矩阵，并转化成概率：
+\[
+C=
+\begin{pmatrix}
+& 82 & 76 & 12 & 8 & 10 \\
+82 & - & 70 & 15 & 6 & 9 \\
+76 & 70 & - & 18 & 10 & 11 \\
+12 & 15 & 18 & - & 68 & 64 \\
+8 & 6 & 10 & 68 & - & 72 \\
+10 & 9 & 11 & 64 & 72 & -
+\end{pmatrix}
+\]
+
+如：$P_{1,2}=0.82,\quad P_{1,3}=0.76,\quad P_{1,5}=0.08$，说明 \(e_1,e_2,e_3\) 常配对出现，再把“共激活概率”转成“距离”：
+\[
+d_{ij}=1-P_{ij}
+\]
+
+则：$d_{1,2}=0.18,\quad d_{1,3}=0.24,\quad d_{1,5}=0.92$，距离越小，说明两个 KV 越该放入同一个共激活簇。
+
+### 步骤 2：选择 Medoid 并聚类
+设定 cluster 半径阈值：$\theta=0.35$，对所有 entry 算“共激活稠密值”，优先选择稠密值高的 entry 作为 medoid。假设 medoid 队列：$[e_1,e_5,e_2,e_3,e_4,e_6]$。
+
+先取 \(e_1\) 作为 medoid：$C_1=\{e_1\}$，查距离 \(e_1\) 不超过 \(\theta=0.35\) 的候选：$e_2:0.18,\quad e_3:0.24$。先加入 \(e_2\)：$C_1=\{e_1,e_2\}$。再得到 \(e_3\) 到当前 cluster 的平均距离：$d(e_3,C_1)=\frac{d_{3,1}+d_{3,2}}{2}
+=\frac{0.24+0.30}{2}=0.27$。
+
+同理，得到两个共激活簇：
+\[
+C_1=\{e_1,e_2,e_3\},
+\quad C_2=\{e_5,e_6,e_4\}
+\]
+
+### 步骤 3：交错共激活
+有时候，KV 访问模式不像上述能完美划分开。比如，上述出现 $P_{3,4}=0.78 \Rightarrow d_{3,4}=0.22$，即 \(e_3\) 既常和 \(e_1,e_2\) 配对出现，也常和 \(e_4\) 同时出现。若一个 entry 只能属于一个 cluster，那查询另一个 cluster 的时候就可能漏掉 $e_3$，而若把 \(C_1,C_2\) 合并：可能把 \(e_1,e_2,e_5,e_6\) 等不常配对出现的 KV 搞混。
+
+所以可以副本：$C_1=\{e_1,e_2,e_3\},\quad C_2=\{e_5,e_6,e_4,e_3\}$，这样 \(e_3\) 同时参与两个访问模式，但在线查询时得去重，防止两个 cluster 都命中时把 \(e_3\) 查两遍。
+
+### 步骤 4：DRAM-SSD 放置
+DRAM 仅存三类“小而关键”的内容：
+1. **Medoid 下标**：各个 cluster 的聚类中心的下标，如 \(e_1,e_5\)；
+2. **Local Window**：最近的若干 token 的 KV；
+3. **Hot Clusters**：高频激活、且访问 SSD 代价高的 cluster。
+
+定义 cluster 的存储收益分：$score(C_i)=f_i\cdot(t_{addr}+|C_i|\cdot t_{entry})$，其中：
+- \(f_i\)：cluster 激活的频率；
+- \(t_{addr}\)：SSD 寻址开销；
+- \(t_{entry}\)：KV entry 的传输开销；
+- \(|C_i|\)：cluster 中 entry 量。
+
+若 DRAM 能存 2 个 cluster，则选择收益分高的簇存储：$C_3, C_1$，剩余 cluster 则放入 SSD。
+
+### 步骤 5：Cluster 内部跨 SSD 轮转放置
+有 4 块 SSD：$SSD_0,SSD_1,SSD_2,SSD_3$，则对 cluster 进行 round-robin 放置。全局 disk pointer 初始 0，对 \(C_1=\{e_1,e_2,e_3\}\)，从 \(SSD_0\) 开始：
+\[
+e_1\rightarrow SSD_0,
+\quad e_2\rightarrow SSD_1,
+\quad e_3\rightarrow SSD_2
+\]
+
+下一个 cluster 从 \(SSD_3\) 开始。对 \(C_2=\{e_5,e_6,e_4,e_3\}\)：
+\[
+e_5\rightarrow SSD_3,
+\quad e_6\rightarrow SSD_0,
+\quad e_4\rightarrow SSD_1,
+\quad e_3\rightarrow SSD_2
+\]
+
+这样取 \(C_2\) 时，4 个 entry 分布在不同 SSD 上，可以并行访问。
+
+### 步骤 6：Medoid 选择 Cluster
+Decode 阶段来到某一步，当前 query 为 \(q\)。在 DRAM 中用 medoid 代表各个 cluster 做初筛。当前 query 和三个 medoid 的点积：
+\[
+q^\top m_1=0.84,
+\quad q^\top m_2=0.31,
+\quad q^\top m_3=0.76
+\]
+
+选择 Top-2 cluster，则激活：$C_1,C_3$。
+
+### 步骤 7：去重 + 负载均衡
+当前 query 激活了两个 cluster：$C_1=\{e_1,e_2,e_3\},\quad C_2=\{e_3,e_4,e_5,e_6\}$，去重得：$R=(C_1\cup C_2)-DRAM_{resident}=\{e_2,e_3,e_4,e_5,e_6\}$，由于存在副本：
+
+| Entry | SSD 副本 |
+| --- | --- |
+| \(e_2\) | \(SSD_1\) |
+| \(e_3\) | \(SSD_2, SSD_3\) |
+| \(e_4\) | \(SSD_1, SSD_2\) |
+| \(e_5\) | \(SSD_3\) |
+| \(e_6\) | \(SSD_0\) |
+
+核心思想：让各个 SSD I/O 均衡。
