@@ -789,3 +789,68 @@ q^\top m_1=0.84,
 | \(e_6\) | \(SSD_0\) |
 
 核心思想：让各个 SSD I/O 均衡。
+
+# LeoAM: Breaking the Boundaries of Long-Context LLM Inference: Adaptive KV Management on a Single Commodity GPU
+论文：https://arxiv.org/abs/2506.20187
+代码：无
+年份：2025.7.2
+核心：单 GPU 上的 GPU-CPU-Disk 分级 KV Cache 管理
+
+## 核心方法
+![alt text](kvcache.assets/20.png)
+### 步骤 1：GPU-CPU-Disk
+情境再现：
+- GPU 显存能放 4 个 chunk；
+- CPU RAM 能放 8 个 chunk；
+- 其余放 SSD。
+
+当前已有 12 个 chunk：$C_1,C_2,\dots,C_{12}$，初始状态：
+| 级 | 存储内容 |
+|---|---|
+| GPU | \(C_9,C_{10},C_{11},C_{12}\) |
+| CPU | \(C_5,C_6,C_7,C_8\) |
+| SSD | \(C_1,C_2,C_3,C_4\) |
+
+### 步骤 2：Attention Weight 分析
+注意到，长上下文 attention 分布非常“偏”。即：大部分 token 的 attention weight 近似于 0；少量区域 attention 很高，且高 attention 区域往往是集中的。
+
+### 步骤 3：Adaptive Chunk
+LeoAM 发现：浅 Layer attention 分散；深 Layer attention 集中。因此，不同 layer 的 chunk size 不同：
+
+| Layer | Chunk Size |
+|---|---|
+| 浅 | 小 chunk |
+| 中 | 中等 chunk |
+| 深 | 大 chunk |
+
+### 步骤 4：KV Abstract（核心）
+SSD 最大瓶颈并非：$attention\ compute$，而是：$Disk\ I/O$，若每轮 importance evaluation 都取完整的 KV，延迟开销过大，于是 LeoAM 提出：仅取对应的 $Abstract$。
+
+比如，某个 chunk：$C_5$，包含：64 个 token 的 KV（$64MB$），$KV=[0.82,0.79,0.81,0.01,0.00,\dots]$，对应的 $Abstract(C_5)=[max=0.82,\ min=0.00]$ 或者 $[0.82,0.81,0.79]$（$8KB$）。
+
+### 步骤 5：Importance Evaluation
+拿当前 query $q$ 和 SSD 中的 abstract 注意力评估（点积），仅选择部分注意力分高的块加载到内存中。
+
+### 步骤 6：Dynamic Compression
+传输过程中，根据当前情况（GPU 压力、CPU 容量、SSD 带宽）将 KV 动态压缩成 FP16/INT8/INT4，进一步加快传输。
+
+### 步骤 7：Dynamic Three-tier Pipeline
+$Disk \rightarrow CPU \rightarrow GPU$ 的串行执行也是一大瓶颈：
+| 时间 | 操作 |
+|---|---|
+| t1 | SSD 取 |
+| t2 | CPU 解压 |
+| t3 | GPU 传输 |
+| t4 | Attention |
+
+流水线并行，比如取：$C_5,C_6,C_7$ 三个块：
+
+| 时间片 | SSD | CPU | GPU |
+|---|---|---|---|
+| T1 | 取 \(C_5\) | - | - |
+| T2 | 取 \(C_6\) | 解压 \(C_5\) | - |
+| T3 | 取 \(C_7\) | 解压 \(C_6\) | 传输 \(C_5\) |
+| T4 | - | 解压 \(C_7\) | 传输 \(C_6\) |
+| T5 | - | - | 传输 \(C_7\) |
+
+显著降低 stall。
