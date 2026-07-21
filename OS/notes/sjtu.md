@@ -458,6 +458,9 @@ ELF 可执行文件
 进程 A：0x400000 → 物理地址 0x123000
 进程 B：0x400000 → 物理地址 0x8A7000
 
+> 注意：物理地址空间 ！= 物理内存空间，前者通常指 **Bus 地址空间**。在 Bus 中，设备都占有一块地址空间，而**内存空间**占了这个空间的 $99\%$。
+>![alt text](sjtu.assets/bus-address-space.png)
+
 ### 分页机制
  
 虚拟地址空间和物理地址空间都被**划分为固定大小的块**：
@@ -621,8 +624,8 @@ AArch64 中常见的 TLB **失效指令**包括：
 
 ```bash
 TLBI VMALLE1IS   // 清除 EL1 阶段一的全部相关 TLB 表项
-TLBI ASIDE1IS    // 清除 ASID 对应的 TLB 表项
-TLBI VAE1IS      // 清除虚拟地址对应的 TLB 表项
+TLBI ASIDE1IS    // 清除 ASIDE1IS 对应的 TLB 表项
+TLBI VAE1IS      // 清除虚拟地址 VAE1IS 对应的 TLB 表项
 ```
 
 其中 IS 表示 Inner Shareable，即失效操作会传播到**同一共享域内的其他 CPU 核**。在多核 OS 中，一个页表可能被多个 CPU 核共享，某个 CPU 修改页表后，必须通知**其他 CPU 清除**旧的 TLB 表项，这一过程称为 TLB Shootdown。
@@ -631,5 +634,540 @@ TLBI VAE1IS      // 清除虚拟地址对应的 TLB 表项
 > ![alt text](sjtu.assets/cortex-a53.png)
 
 # 系统初始化
+
+## 基本流程
+
+计算机从上电到 OS 内核开始运行，大致有以下三个阶段：
+
+1. BIOS 执行
+
+上电后，CPU 开始执行 **BIOS ROM** 中的代码，完成：
+
+* 执行 POST（Power-On Self Test，上电自检），检查 CPU 和内存；
+* 初始化早期硬件；
+* 寻找首个**可启动设备**；
+* 将**可启动设备**的首个**扇区**，即 MBR（Master Boot Record，主引导记录），加载到内存中的**固定地址**；
+* 跳转到 MBR 中 bootloader 的入口地址执行。
+
+2. Bootloader 执行
+
+Bootloader 是固件和 OS 内核的引导程序，常见的 Bootloader 有 GRUB。其核心工作包括：
+
+* 从**可启动设备**中找到**内核二进制文件**；
+* 将**内核加载**到内存中；
+* 如果内核文件被压缩，则对其进行解压；
+* 跳转到内核入口地址，将 CPU **控制权交由内核**。
+
+3. 内核开始执行
+
+内核获得控制权后，完成：
+
+* 初始**页表**并开启虚拟内存；
+* 初始化**异常向量表、中断和定时器**；
+* 初始化**内存管理**、**进程管理**和**驱动**；
+* 初始化并**挂载 FS（File System）**；
+* 启动首个**用户态进程**，如 Linux 中的 init 或 systemd；
+* 由首个用户态进程往下执行。
+
+## ChCore
+
+ChCore 的启动过程含两部分代码：
+
+* kernel/arch/aarch64/boot/raspi3：树莓派 3 平台相关的早期启动代码；
+* kernel/arch/aarch64：内核初始化入口。
+
+目录大致如下：
+
+```bash
+kernel/arch/aarch64
+├── boot
+├── head.S
+├── main.c
+├── plat
+└── tools.S
+
+kernel/arch/aarch64/boot/raspi3
+├── firmware
+├── include
+├── init
+└── peripherals
+```
+
+其中：
+
+* firmware：与树莓派固件、Bootloader 相关的代码；
+* init：启动阶段最早执行的汇编和 C 代码；
+* peripherals：UART 等**早期外设**初始化代码；
+* include：启动阶段的头文件。
+
+编译后，boot/raspi3 下的**启动代码**被放入**内核镜像的 .init 段**，位于较低的物理地址；**正式内核代码**被放入 **.text 段**，并映射到高虚拟地址。完整的启动流程如下：
+
+树莓派固件**加载 ChCore 镜像**
+        ↓
+从低物理地址执行 **.init 段**
+        ↓
+进入 **_start**
+        ↓
+选出主 CPU
+        ↓
+将 CPU 从 **EL3/EL2 切到 EL1**
+        ↓
+设置**临时启动栈**
+        ↓
+进入 **init_c**
+        ↓
+清空 BSS、初始化串口和页表
+        ↓
+开启 MMU
+        ↓
+跳转到**高虚拟地址 start_kernel**
+        ↓
+切到**正式内核栈**
+        ↓
+进入 main
+
+### 内核镜像的起始地址
+
+ChCore 在头文件中定义了内核虚拟地址和启动代码的**偏移**。文件：`kernel/arch/aarch64/boot/raspi3/include/image.h`，代码：
+
+```c
+#pragma once
+#define SZ_16K       0x4000
+#define SZ_64K       0x10000
+#define KERNEL_VADDR 0xffffff0000000000
+#define TEXT_OFFSET  0x80000
+```
+
+其中 `#define KERNEL_VADDR 0xffffff0000000000` 表示 ChCore 内核所处的**高虚拟地址空间基地址**；`#define TEXT_OFFSET 0x80000` 表示**启动镜像**被加载到物理地址 0x80000 附近。
+
+### 启动代码被放入 .init 段
+
+`boot/raspi3/CMakeLists.txt` 中指定了启动阶段编译的源文件，代码大致如下：
+
+```cmake
+list(
+    APPEND
+    _init_sources
+    init/start.S
+    init/mmu.c
+    init/tools.S
+    init/init_c.c
+    peripherals/uart.c
+)
+set(init_objects
+    ${_init_objects}
+    PARENT_SCOPE
+)
+```
+
+这些源文件编译后形成 init_objects，**链接脚本**将它们放到 .init 段。其中 `init/start.S` 是最早执行的**内核启动入口**。
+
+### 链接脚本排布启动代码
+
+文件：`kernel/arch/aarch64/boot/linker.tpl.ld`，代码：
+
+```c
+#include "../boot/image.h"
+SECTIONS
+{
+    . = TEXT_OFFSET;
+    img_start = .;
+    .init : {
+        ${init_object}
+    }
+    . = ALIGN(SZ_16K);
+    init_end = ABSOLUTE(.);
+}
+```
+
+代码从上到下：
+1. 设当前位置 . 等于 TEXT_OFFSET（即 0x80000）；
+2. 记录镜像起始地址 `img_start = .`；
+3. 将前面 CMake 收集到的**启动目标文件**放入 .init 段。因此，start.S、init_c.c、启动页表初始化等代码都将被放在镜像开头的低地址区域；
+4. 将当前位置向上对齐到 16 KiB；
+5. 记录 .init 段结束地址。
+
+### 内核执行的首行代码：_start
+
+文件：`kernel/arch/aarch64/boot/raspi3/init/start.S`，核心代码如下：
+
+```s
+BEGIN_FUNC(_start)
+    mrs x8, mpidr_el1        /* move core ID to x8 */
+    and x8, x8, #0xFF        /* mask */
+    cbz x8, primary          /* compare branch zero */
+```
+
+代码从上到下：
+1. 将 CPU 核心的相关信息放入 x8；
+2. 将 MPIDR_EL1 的低 8 位取出，近似视作 CPU 核心的编号；
+3. 主 CPU 跳转，仅有主 CPU 才能进入初始化，其余 CPU 等待被主 CPU 唤醒。
+
+### 主 CPU 的启动流程
+
+primary 核心代码如下：
+
+```s
+primary:
+    /* Turn to el1 from other exception levels. */
+    bl arm64_elX_to_el1
+    /* Prepare stack pointer and jump to C. */
+    adr x0, boot_cpu_stack
+    add x0, x0, #0x1000
+    mov sp, x0
+    bl init_c
+    /* Should never be here */
+    b .
+```
+
+代码从上到下：
+1. 跳转到 arm64_elX_to_el1（检查 CPU 当前所处的**异常级别**，并最终保证 CPU 在 EL1 中运行）；
+2. boot_cpu_stack 表示**栈空间**的低地址，再加上 0x1000（$0x1000=4096B=4KiB$），让 x0 指向栈顶；
+3. 将 x0 写入栈指针 sp，栈正式生效；
+4. init_c 最终进入正式内核，**不该再返回**到 _start。如果意外返回则通过 `bl .` 一直跳转到自己，而非执行未知内容。
+
+> 注：从汇编代码进入 C 代码前，**必须先设置**一个可用的栈？
+
+### 将 CPU 从 EL3 或 EL2 切到 EL1
+
+代码大致如下：
+
+```s
+BEGIN_FUNC(arm64_elX_to_el1)
+    mrs x9, CurrentEL
+    /* Check the current exception level. */
+    cmp x9, CURRENTEL_EL1
+    beq .Ltarget
+    cmp x9, CURRENTEL_EL2
+    beq .Lin_el2
+    /* Otherwise, we are in EL3. */
+    mrs x9, scr_el3
+    mov x10, SCR_EL3_NS | SCR_EL3_HCE | SCR_EL3_RW
+    orr x9, x9, x10
+    msr scr_el3, x9
+    /* Set the return address and exception level. */
+    adr x9, .Ltarget
+    msr elr_el3, x9
+    mov x9, SPSR_ELX_DAIF | SPSR_ELX_EL1H
+    msr spsr_el3, x9
+    isb
+    eret
+.Ltarget:
+    ret
+END_FUNC(arm64_elX_to_el1)
+```
+
+核心目标：无论 CPU 当前在 EL3、EL2 还是 EL1，最终都进入 EL1。
+
+### 临时启动栈
+
+**启动栈**定义在：`kernel/arch/aarch64/boot/raspi3/init/init_c.c`，相关代码如下：
+
+```c
+#include "boot.h"
+#include "image.h"
+typedef unsigned long u64;
+#define INIT_STACK_SIZE 0x1000
+char boot_cpu_stack[PLAT_CPU_NUMBER][INIT_STACK_SIZE]
+    ALIGN(16);
+```
+
+比如树莓派 3 有 4 个 CPU 核，且栈大小为 4 KiB，则整体布局：
+
+boot_cpu_stack[0]：CPU 0 的临时启动栈
+boot_cpu_stack[1]：CPU 1 的临时启动栈
+boot_cpu_stack[2]：CPU 2 的临时启动栈
+boot_cpu_stack[3]：CPU 3 的临时启动栈
+
+### 启动代码 init_c
+
+init_c 的代码代码大致如下：
+
+```c
+void init_c(void)
+{
+    /* Clear the bss area for the kernel image */
+    clear_bss();
+    /* Initialize UART before enabling MMU. */
+    early_uart_init();
+    uart_send_string("boot: init_c\r\n");
+    wakeup_other_cores();
+    /* Initialize Boot Page Table. */
+    uart_send_string("[BOOT] Install boot page table\r\n");
+    init_boot_pt();
+    /* Enable MMU. */
+    el1_mmu_activate();
+    uart_send_string("[BOOT] Enable el1 MMU\r\n");
+    /* Call Kernel Main. */
+    uart_send_string("[BOOT] Jump to kernel main\r\n");
+    start_kernel(secondary_boot_flag);
+    /* Never reach here */
+}
+```
+
+代码从上到下：
+1. clear_bss()：清空 .bss 段
+2. early_uart_init()：初始化早期串口，并通过 uart_send_string 输出日志
+3. wakeup_other_cores()：**唤醒其他 CPU 核**
+4. init_boot_pt()：初始化早期页表
+5. el1_mmu_activate()：开启 MMU
+6. start_kernel(secondary_boot_flag)：跳转到正式内核入口
+
+### start_kernel 代码
+
+文件：`kernel/arch/aarch64/head.S`，代码如下：
+
+```s
+BEGIN_FUNC(start_kernel)     // high memory addr
+    /*
+     * Code in bootloader specified only the primary
+     * cpu with MPIDR = 0 can boot here. So we directly
+     * set the TPIDR_EL1 to 0, which represent the logical
+     * cpuid in the kernel
+     */
+    mov x3, #0
+    msr TPIDR_EL1, x3
+    ldr x2, =kernel_stack    // high memory addr
+    add x2, x2, KERNEL_STACK_SIZE
+    mov sp, x2               // switch stack, important
+    bl main
+END_FUNC(start_kernel)
+```
+
+代码从上到下：
+1. 前面的**启动代码**规定仅有主 CPU 能进入这里，将主 CPU 的编号置 0，即 TPIDR_EL1 = 0；
+2. 将 kernel_stack 的**地址加载**到 x2，由于 MMU 已开启，此时 kernel_stack 是高虚拟地址；
+3. 将栈起始地址加上栈大小，得到栈顶地址；
+4. 将正式**内核栈的栈顶地址**写入 sp。由此前启动阶段的临时栈 boot_cpu_stack 切成正式的内核栈 kernel_stack。
+
+### 启动页表初始化
+
+启动页表初始化含两部分：
+
+* TTBR0_EL1：负责低虚拟地址区域，即将低虚拟地址 → 相同的低物理地址（恒等映射）；
+* TTBR1_EL1：负责高虚拟地址区域，即将内核高虚拟地址 → 内核实际所在的低物理地址。
+
+```c
+/* The number of entries in one page table page */
+#define PTP_ENTRIES 512
+/* The size of one page table page */
+#define PTP_SIZE 4096
+#define ALIGN(n) __attribute__((__aligned__(n)))
+u64 boot_ttbr0_l0[PTP_ENTRIES] ALIGN(PTP_SIZE);
+u64 boot_ttbr0_l1[PTP_ENTRIES] ALIGN(PTP_SIZE);
+u64 boot_ttbr0_l2[PTP_ENTRIES] ALIGN(PTP_SIZE);
+u64 boot_ttbr1_l0[PTP_ENTRIES] ALIGN(PTP_SIZE);
+u64 boot_ttbr1_l1[PTP_ENTRIES] ALIGN(PTP_SIZE);
+u64 boot_ttbr1_l2[PTP_ENTRIES] ALIGN(PTP_SIZE);
+```
+
+这里一共定义了两个启动页表：`boot_ttbr0_*` 用于低地址映射，`boot_ttbr1_*` 用于高地址映射。页大小 4096B，即 4KiB。单张页表能容纳 512 个页表项。
+
+> 注：在**启动阶段**，L2 页表项是块描述符，映射一个 2 MiB 大页。目的是简单、高效，正式开启 MMU 之后才精细化成 4KB 的页。
+
+```c
+void init_boot_pt(void)
+{
+    u32 start_entry_idx;
+    u32 end_entry_idx;
+    u32 idx;
+    u64 kva;
+    /* TTBR0_EL1 0-1G */
+    boot_ttbr0_l0[0] =
+        ((u64)boot_ttbr0_l1) | IS_TABLE | IS_VALID;
+    boot_ttbr0_l1[0] =
+        ((u64)boot_ttbr0_l2) | IS_TABLE | IS_VALID;
+    /* Usable memory: PHYSMEM_START ~ PERIPHERAL_BASE */
+    start_entry_idx = PHYSMEM_START / SIZE_2M;
+    end_entry_idx = PERIPHERAL_BASE / SIZE_2M;
+    /* Map each 2M page */
+    for (idx = start_entry_idx; idx < end_entry_idx; ++idx) {
+        boot_ttbr0_l2[idx] =
+            (PHYSMEM_START + idx * SIZE_2M)
+            | UXN
+            | ACCESSED
+            | INNER_SHARABLE
+            | NORMAL_MEMORY
+            | IS_VALID;
+    }
+    /*
+     * TTBR1_EL1 0-1G
+     * KERNEL_VADDR: L0 pte index: 510,
+     *               L1 pte index: 0,
+     *               L2 pte index: 0.
+     */
+    kva = KERNEL_VADDR;
+    boot_ttbr1_l0[GET_L0_INDEX(kva)] =
+        ((u64)boot_ttbr1_l1) | IS_TABLE | IS_VALID;
+    boot_ttbr1_l1[GET_L1_INDEX(kva)] =
+        ((u64)boot_ttbr1_l2) | IS_TABLE | IS_VALID;
+    start_entry_idx = GET_L2_INDEX(kva);
+    /* Note: assert(start_entry_idx == 0); */
+    end_entry_idx =
+        start_entry_idx + PHYSMEM_BOOT_END / SIZE_2M;
+    /* Note: assert(end_entry_idx < PTP_ENTRIES); */
+    /*
+     * Map each 2M page
+     * Usable memory: PHYSMEM_START ~ PERIPHERAL_BOOT_END
+     */
+    for (idx = start_entry_idx; idx < end_entry_idx; ++idx) {
+        boot_ttbr1_l2[idx] =
+            (PHYSMEM_START + idx * SIZE_2M)
+            | UXN
+            | ACCESSED
+            | INNER_SHARABLE
+            | NORMAL_MEMORY
+            | IS_VALID;
+    }
+}
+```
+
+#### 初始化 TTBR0 页表
+
+1. 设置 L0/L1 页表项
+
+boot_ttbr0_l0[0] = ((u64)boot_ttbr0_l1) | IS_TABLE | IS_VALID;
+
+即 boot_ttbr0_l0[0] 指向 boot_ttbr0_l1（L1 页表的物理基地址）;IS_TABLE 表示该页表项是表描述符；IS_VALID 表示该页表项有效。于是低地址翻译路径如下：
+
+TTBR0_EL1
+    ↓
+boot_ttbr0_l0[0]
+    ↓
+boot_ttbr0_l1[0]
+    ↓
+boot_ttbr0_l2[index]
+    ↓
+最终物理地址
+
+2. 恒等映射
+
+核心地址部分是：
+
+$$boot\_ttbr0\_l2[idx]=PHYSMEM\_START + idx * SIZE\_2M$$
+
+即：
+虚拟地址 0x00000000 → 物理地址 0x00000000；
+虚拟地址 0x00200000 → 物理地址 0x00200000；
+虚拟地址 0x00400000 → 物理地址 0x00400000。
+
+#### 初始化 TTBR1 高地址页表
+
+TTBR0 从虚拟地址 0 开始，而 TTBR1 从 KERNEL_VADDR 开始。
+
+```c
+#define GET_L0_INDEX(x) (((x) >> (12 + 9 + 9 + 9)) & 0x1ff)
+#define GET_L1_INDEX(x) (((x) >> (12 + 9 + 9)) & 0x1ff)
+#define GET_L2_INDEX(x) (((x) >> (12 + 9)) & 0x1ff)
+```
+
+于是高地址页表翻译路径如下：
+
+KERNEL_VADDR
+    ↓
+boot_ttbr1_l0[510]
+    ↓
+boot_ttbr1_l1[0]
+    ↓
+boot_ttbr1_l2[0]
+    ↓
+低物理地址
+
+KERNEL_VADDR + 0 → PHYSMEM_START + 0；
+KERNEL_VADDR + 2 MiB → PHYSMEM_START + 2 MiB；
+KERNEL_VADDR + 4 MiB → PHYSMEM_START + 4 MiB。
+
+<div align="center">
+  <img src="sjtu.assets/boot_ttbr.png" alt="Function call parameter passing and return value illustration" width="100%">
+</div>
+
+也就是说，同一块**低物理内存**可能同时有两个虚拟地址，来保证开启 MMU 瞬间 PC 有效。开启 MMU 和跳转到高地址不是同一条指令完成的，中间还有一小段代码。
+
+### 开启 MMU
+
+el1_mmu_activate() 必须操作**特权寄存器**：
+
+* MAIR_EL1；
+* TCR_EL1；
+* TTBR0_EL1；
+* TTBR1_EL1；
+* SCTLR_EL1；
+* TLB 和 Cache 控制指令。
+
+特权汇编指令，普通 C 语言无法表达，因此必须**汇编实现**。此外，开启 MMU 的瞬间，**地址翻译方式**发生根本变化，控制指令顺序和屏障由汇编代码较可靠。
+
+```s
+BEGIN_FUNC(el1_mmu_activate)
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    bl invalidate_cache_all
+    /* Invalidate TLB */
+    tlbi vmalle1is
+    isb
+    dsb sy
+    /* Initialize Memory Attribute Indirection Register */
+    ldr x8, =MMU_MAIR_ATTR1 | MMU_MAIR_ATTR2 | MMU_MAIR_ATTR3
+    msr mair_el1, x8
+    /* Initialize TCR_EL1 */
+    /*
+     * Set cacheable attributes on translation walk.
+     * SMP extensions: non-shareable, inner write-back write-allocate.
+     */
+    ldr x8, =MMU_TCR_FLAGS1 | MMU_TCR_FLAGS0
+              | MMU_TCR_IPS | MMU_TCR_AS
+    msr tcr_el1, x8
+    isb
+    /* Write TTBR with physical address of the translation table */
+    adrp x8, boot_ttbr0_l0
+    msr ttbr0_el1, x8
+    adrp x8, boot_ttbr1_l0
+    msr ttbr1_el1, x8
+    isb
+    mrs x8, sctlr_el1
+    /* Enable MMU */
+    orr x8, x8, #SCTLR_EL1_M
+    /* Disable alignment checking */
+    bic x8, x8, #SCTLR_EL1_A
+    bic x8, x8, #SCTLR_EL1_SA0
+    bic x8, x8, #SCTLR_EL1_SA
+    orr x8, x8, #SCTLR_EL1_nAA
+    /* Data accesses Cacheable */
+    orr x8, x8, #SCTLR_EL1_C
+    /* Instruction access Cacheable */
+    orr x8, x8, #SCTLR_EL1_I
+    msr sctlr_el1, x8
+    ldp x29, x30, [sp], #16
+    ret
+END_FUNC(el1_mmu_activate)
+```
+
+1. 压栈：x29 原帧指针；x30 返回地址 LR
+2. 清理 Cache，清空 TLB
+3. 置**内存属性寄存器** MAIR_EL1
+
+ldr x8, =MMU_MAIR_ATTR1 | MMU_MAIR_ATTR2 | MMU_MAIR_ATTR3
+msr mair_el1, x8
+
+4. 置**地址翻译控制寄存器** TCR_EL1
+
+ldr x8, =MMU_TCR_FLAGS1 | MMU_TCR_FLAGS0 | MMU_TCR_IPS | MMU_TCR_AS
+msr tcr_el1, x8
+
+5. 将两个页表基地址**分别写入** TTBR*_EL1
+
+adrp x8, boot_ttbr0_l0
+msr ttbr0_el1, x8
+adrp x8, boot_ttbr1_l0
+msr ttbr1_el1, x8
+
+6. 开启 MMU
+
+SCTLR_EL1.M 是 MMU 开关位，M = 1：开启地址翻译。但此时是修改了 x8 中的临时值，MMU 尚未真正开启，真正生效得等到：`msr sctlr_el1, x8` 执行。
+
+7. 配置地址对齐检查；开启 Data Cache、指令 Cache
+8. MMU 生效：msr sctlr_el1, x8，执行这条指令之后，PC 和所有访存地址都得过 MMU 翻译
+9. 恢复现场并返回
+
+### 异常向量表初始化
 
 
