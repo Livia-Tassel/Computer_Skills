@@ -1078,7 +1078,8 @@ KERNEL_VADDR + 2 MiB → PHYSMEM_START + 2 MiB；
 KERNEL_VADDR + 4 MiB → PHYSMEM_START + 4 MiB。
 
 <div align="center">
-  <img src="sjtu.assets/boot_ttbr.png" alt="Function call parameter passing and return value illustration" width="100%">
+  <img src="sjtu.assets/boot_ttbr.png"
+  width="100%">
 </div>
 
 也就是说，同一块**低物理内存**可能同时有两个虚拟地址，来保证开启 MMU 瞬间 PC 有效。开启 MMU 和跳转到高地址不是同一条指令完成的，中间还有一小段代码。
@@ -1429,10 +1430,276 @@ el0_syscall:
 
 ## 虚拟内存管理
 
+### 内核页表
 
+OS 启动时将一段**可用物理内存**映射到内核虚拟地址空间，一般通过直接映射：
+
+$$
+\text{内核虚拟地址}=\text{物理地址}+\text{固定偏移}
+$$
+
+比如：物理地址 `0x00100000` 加上 `KERNEL_OFFSET` → 内核虚拟地址 `KERNEL_OFFSET + 0x00100000`，这样内核可以快速进行转化：
+
+```c
+vaddr = paddr_to_vaddr(paddr);
+paddr = vaddr_to_paddr(vaddr);
+```
+
+### 进程页表
+
+进程通常拥有独立的用户页表，内核在**进程控制结构**中维护该进程的顶级页表物理地址（页表基地址）：
+
+```c
+struct process {
+    struct context *ctx;
+    u64 pgtbl;
+    ...
+};
+```
+
+注意：开启 MMU 后，不能用物理地址寻址，包括 OS。所以内核在修改页表时，必须先通过直接映射把 `pgtbl` 转成虚拟地址（指针）再访问：
+
+```c
+u64 *pgtbl_page = (u64 *)paddr_to_vaddr(process->pgtbl);
+pgtbl_page[index] = next_pgtbl_pa | TABLE_DESC | VALID;
+```
+
+### 立即映射
+
+立即映射指在初始化进程虚拟地址空间时，立即**分配物理页**和对应的页表映射。以下代码展示进程如何添加虚拟地址 va 到物理地址 pa 的映射：
+
+```c
+void add_mapping(struct process *p,
+                 u64 va,
+                 u64 pa,
+                 u64 permission)
+{
+    u64 *pgtbl_page;
+    u32 index;
+    pgtbl_page =
+        (u64 *)paddr_to_vaddr(p->pgtbl);
+
+    index = L0_INDEX(va);
+    pgtbl_page =
+        get_next_pgtbl_page(pgtbl_page, index);
+    index = L1_INDEX(va);
+    pgtbl_page =
+        get_next_pgtbl_page(pgtbl_page, index);
+    index = L2_INDEX(va);
+    pgtbl_page =
+        get_next_pgtbl_page(pgtbl_page, index);
+    index = L3_INDEX(va);
+
+    pgtbl_page[index] =
+        pa | permission | PAGE_DESC | VALID;
+}
+```
+
+虚拟地址 va
+   │
+   ├── L0_INDEX(va) → 查找 L0 页表项
+   ├── L1_INDEX(va) → 查找 L1 页表项
+   ├── L2_INDEX(va) → 查找 L2 页表项
+   └── L3_INDEX(va) → 填写最终页表项
+
+get_next_pgtbl_page() 的作用是获取下一级页表。如果对应页表项空，就先**分配一个新的页表页**：
+
+```c
+u64 *get_next_pgtbl_page(u64 *pgtbl,
+                         u32 index)
+{
+    u64 entry;
+    u64 next_pgtbl_pa;
+    u64 *next_pgtbl_va;
+    entry = pgtbl[index];
+    if (!(entry & VALID)) {
+
+        next_pgtbl_pa = alloc_pgtbl_page();
+        next_pgtbl_va =
+            (u64 *)paddr_to_vaddr(next_pgtbl_pa);
+        memset(next_pgtbl_va, 0, PAGE_SIZE);
+
+        pgtbl[index] =
+            next_pgtbl_pa | TABLE_DESC | VALID;
+        entry = pgtbl[index];
+    }
+
+    // extract the physical address portion.
+    next_pgtbl_pa = PTE_ADDR(entry);
+    return (u64 *)paddr_to_vaddr(next_pgtbl_pa);
+}
+```
+
+删除映射时，找到对应的末级页表项并将其置无效即可：
+
+void delete_mapping(struct process *p, u64 va)
+{
+    // 逐级查找 va 对应的 L3 页表项
+    // 将页表项标记无效
+    // 释放对应物理页（可选）
+    // 刷新该虚拟地址对应的 TLB 表项
+}
+
+### 延迟映射
+
+延迟映射核心思想是：先给进程分配虚拟地址范围，当进程**实际访问**某个虚拟页时，才给它分配物理页并完成页表映射。此时，虚拟页分配与物理页分配被**解耦**。
+
+当进程访问尚未映射的虚拟页时，MMU 查询页表失败，CPU 触发缺页异常。内核首先检查该地址是否属于**合法虚拟内存区域**。如果合法，则分配物理页并将映射写入页表、刷新相关 TLB 表项；反之，地址非法或权限错误，则向进程发送 SIGSEGV 并终止，终端可能显示：Segmentation fault (core dumped)。
+
+### 虚拟内存区域
+
+**虚拟内存区域**是由 OS 维护的**软件信息**，用于描述：
+
+- 哪些虚拟地址**属于**进程
+- 这些地址**允许如何**访问
+- 页面内容来自**哪里**
+
+在 Linux 中，一个**虚拟内存区域**通常由 vm_area_struct 描述，简称 VMA。在 ChCore-Lab 中，对应的结构通常称 vmregion 或 vmr：
+
+```c
+struct process {
+    struct context *ctx;
+    // process's virtual address space
+    struct vmspace *vmspace;
+    ...
+};
+struct vmspace {
+    // physical address of the process's top-level page table
+    u64 pgtbl;
+    // process-owned virtual memory regions
+    list vmregions;
+};
+struct vmregion {
+    // [start, end)
+    u64 start;
+    u64 end;
+    // access permissions
+    u64 perm;
+    ...
+};
+```
+
+VMA 可以通过两种方式加入进程的虚拟地址空间：
+
+1. 进程**创立时**由 OS 添加
+2. 进程**运行时**动态添加或修改
+  - `mmap()`：添加匿名映射或文件映射；
+  - `munmap()`：删除一段虚拟内存映射；
+  - `brk()`：扩大或缩小堆区域；
+  - 栈增长：OS 在满足一定条件时扩展栈 VMA。
+
+#### mmap
+
+`mmap()` 用于在进程虚拟地址空间中添加一段新的**虚拟内存区域**。它既可以映射文件，也可以添加不对应任何文件的匿名映射。
+
+```c
+void *mmap(void *addr,
+           size_t length,
+           int prot,
+           int flags,
+           int fd,
+           off_t offset);
+```
+
+其中：
+
+* addr：期望映射的虚拟地址（内核可以选择其他合适的虚拟地址）；
+* length：映射区域的长度；
+* prot：访问权限，如 PROT_READ、PROT_WRITE、PROT_EXEC；
+* flags：映射类型，如 MAP_PRIVATE、MAP_SHARED、MAP_ANONYMOUS；
+* fd：被映射文件的文件描述符，匿名映射通常传入 -1；
+* offset：从文件的哪个偏移位置开始映射。
+
+mmap() 成功时返回新区域的虚拟地址，失败时返回 MAP_FAILED。
+
+##### 匿名映射
+
+匿名映射不对应任何文件，常用于申请一段初始内容 0 的空间：
+
+```c
+char *buf;
+buf = mmap((void *)0x500000000,
+           0x2000,
+           PROT_READ | PROT_WRITE,
+           MAP_ANONYMOUS | MAP_PRIVATE,
+           -1,
+           0);
+if (buf == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+}
+strcpy(buf, "Hello mmap");
+printf("%s\n", buf);
+```
+
+其中 0x2000 表示申请 8 KiB 的虚拟地址区域。执行成功后，进程的 VMA 集合中增加一段新的匿名区域。延迟映射时，mmap() 返回成功通常代表虚拟地址区域已分配，并不代表全部物理页已分配。
+
+##### mmap 映射文件
+
+mmap() 也可以把一个文件或文件的一部分映射到进程虚拟地址空间：
+
+```c
+int fd;
+struct stat sb;
+char *addr;
+fd = open("hello.txt", O_RDONLY);
+fstat(fd, &sb);
+addr = mmap(NULL,
+            sb.st_size,
+            PROT_READ,
+            MAP_PRIVATE,
+            fd,
+            0);
+if (addr == MAP_FAILED) {
+    perror("mmap");
+    close(fd);
+    return 1;
+}
+write(STDOUT_FILENO, addr, sb.st_size);
+munmap(addr, sb.st_size);
+close(fd);
+```
+
+映射成功后，就可以像访问**普通内存**一样访问**文件内容**。
+
+#### munmap
+
+munmap() 用于解除一段虚拟地址区域的映射：`int munmap(void *addr, size_t length)`。执行 munmap() 后，OS 通常：
+
+1. 删除指定范围内的页表映射；
+2. 刷新相应的 TLB 表项；
+3. 释放不再用的物理页或文件页引用；
+4. 修改对应的 VMA。
+
+#### brk 与堆 VMA
+
+brk() 用于修改进程堆的结束地址，从而扩大或缩小堆区域。
+
+原来的堆 VMA：
+heap_start ---------------- heap_end
+执行 brk 扩大堆后：
+heap_start ------------------------- new_heap_end
+
+因此，brk() 通常不添加一个完全独立的新 VMA，而是修改已有堆 VMA 的结束位置。与 mmap() 类似，扩大堆的虚拟地址范围不一定立即分配所有物理页。
+
+### 缺页异常合法性
+
+在 AArch64 中，访问暂无有效映射的虚拟地址时，通常表现 **Instruction Abort** 或 **Data Abort**，它们都属于同步异常。异常发生后，硬件记录：
+- `ESR_EL1`：异常类型和具体原因，比如地址翻译失败、权限检查失败；
+- `FAR_EL1`：本次访问发生异常的虚拟地址；
+- `ELR_EL1`：发生异常时的 PC。
+
+### 写时复制
+
+写时复制（Copy-on-Write，COW）的核心思想是：多个地址空间首先**共享同一个物理页**，当某个进程写入该页时，才给它复制一份新的物理页。
+
+<div align="center">
+  <img src="sjtu.assets/cow.png"
+  width="80%">
+</div>
+
+一个很典型的应用场景就是 fork()。fork() 子进程后，父子进程的**虚拟地址空间内容几乎相同**（但各自独立）。如果立即复制所有物理页，时间和内存开销较大。当他们想写入某个**共享页**时，由于页表项设成 `Read_Only`，CPU 触发权限异常，于是分配一个新的物理页并将原物理页的内容复制到新物理页，同时刷新映射。
 
 ## 物理内存管理
-
-
 
 
