@@ -1170,4 +1170,269 @@ SCTLR_EL1.M 是 MMU 开关位，M = 1：开启地址翻译。但此时是修改�
 
 ### 异常向量表初始化
 
+基本流程如下：
+
+内核 main
+  ↓
+arch_interrupt_init()
+  ↓
+arch_interrupt_init_per_cpu()
+  ↓
+关闭 IRQ
+  ↓
+set_exception_vector()
+  ↓
+将 el1_vector 地址写入 VBAR_EL1
+  ↓
+CPU 发生异常
+  ↓
+根据异常来源和类型跳转到对应异常入口
+  ↓
+保护上下文
+  ↓
+函数
+  ↓
+恢复上下文并 eret 返回
+
+`kernel/main.c` 中，内核完成锁、串口和各种管理初始化后，进入 `arch_interrupt_init()`：
+
+```c
+void main(paddr_t boot_flag)
+{
+    u32 ret = 0;
+    /* Init big kernel lock */
+    kernel_lock_init();
+    kinfo("[ChCore] lock init finished\n");
+    BUG_ON(ret != 0);
+    /* Init uart: no need to init the uart again */
+    uart_init();
+    kinfo("[ChCore] uart init finished\n");
+#ifdef CHCORE_KERNEL_TEST
+    lab2_test_kernel_vaddr();
+#endif
+    /* Init mm */
+    mm_init();
+    kinfo("[ChCore] mm init finished\n");
+#ifdef CHCORE_KERNEL_TEST
+    void lab2_test_kmalloc(void);
+    lab2_test_kmalloc();
+    void lab2_test_page_table(void);
+    lab2_test_page_table();
+#endif
+    /* Init exception vector */
+    arch_interrupt_init();
+}
+```
+
+#### arch_interrupt_init
+
+代码如下：
+
+```c
+void arch_interrupt_init_per_cpu(void)
+{
+    disable_irq();
+    /* platform dependent init */
+    set_exception_vector();
+    plat_interrupt_init();
+}
+void arch_interrupt_init(void)
+{
+    arch_interrupt_init_per_cpu();
+    memset(irq_handle_type, HANDLE_KERNEL, MAX_IRQ_NUM);
+}
+```
+
+`void arch_interrupt_init_per_cpu(void)` 表示**其中的初始化工作**是各个 CPU 核必须单独完成的。原因是**某些寄存器**是 CPU 核私有的，比如**异常向量表基地址** VBAR_EL1，必须由各个 CPU 自己设置。
+
+#### 关闭 IRQ
+
+`disable_irq()` 在异常向量表和中断控制器尚未完全初始化之前，先**关闭普通中断** IRQ。否则，如果初始化过程中收到中断，而异常入口尚未完成，CPU 可能跳转到错误地址。
+
+#### 设置异常向量表
+
+`set_exception_vector()` 将异常向量表的基地址写入 VBAR_EL1：
+
+```s
+BEGIN_FUNC(set_exception_vector)
+    adr x0, el1_vector
+    msr vbar_el1, x0
+    ret
+END_FUNC(set_exception_vector)
+```
+
+其中 el1_vector 是 ChCore 的 EL1 异常向量表基地址。
+
+#### 初始化平台中断控制器
+
+`plat_interrupt_init()` 这部分与具体平台有关，可能初始化：
+
+* 中断控制器；
+* 定时器中断；
+* UART 中断；
+* CPU 本地中断；
+* 中断屏蔽和优先级。
+
+#### 异常向量表
+
+代码如下：
+
+```s
+EXPORT(el1_vector)
+/* Current EL with SP_EL0 */
+exception_entry sync_el1t
+exception_entry irq_el1t
+exception_entry fiq_el1t
+exception_entry error_el1t
+/* Current EL with SP_ELx */
+exception_entry sync_el1h
+exception_entry irq_el1h
+exception_entry fiq_el1h
+exception_entry error_el1h
+/* Lower EL using AArch64 */
+exception_entry sync_el0_64
+exception_entry irq_el0_64
+exception_entry fiq_el0_64
+exception_entry error_el0_64
+/* Lower EL using AArch32 */
+exception_entry sync_el0_32
+exception_entry irq_el0_32
+exception_entry fiq_el0_32
+exception_entry error_el0_32
+```
+
+AArch64 的 EL1 异常向量表一共有 16 个入口。常见的 svc #0 进入 sync_el0_64。其中 sync 表示同步异常，而 irq 表示普通中断，fiq 表示快速中断（优先级高），error 表示错误。
+
+异常入口本质上即一个**宏跳转指令**：
+
+```s
+.macro exception_entry label
+    /* Each entry should be 0x80 aligned */
+    .align 7
+    b \label
+.endm
+```
+
+其中 .align 7 表示以 2^7 = 128 B = 0x80 B 对齐，即异常向量表中所有入口占用固定的 0x80 B 空间。
+
+#### 同步异常入口
+
+当 64 位 EL0 出现同步异常时，进入 sync_el0_64，代码如下：
+
+```s
+sync_el0_64:
+    /* Since we cannot touch x0-x7, we need some extra work here */
+    exception_enter
+    mrs x25, esr_el1
+    lsr x24, x25, #ESR_EL1_EC_SHIFT
+    cmp x24, #ESR_EL1_EC_SVC_64
+    b.eq el0_syscall
+    /* Not supported exception */
+    mov x0, SYNC_EL0_64
+    mrs x1, esr_el1
+    mrs x2, elr_el1
+    bl handle_entry_c
+    bl unlock_kernel
+    exception_exit
+```
+
+其中 exception_enter 用来保护用户态进入内核前的 CPU 上下文，代码如下：
+
+```s
+.macro exception_enter
+    sub sp, sp, #ARCH_EXEC_CONT_SIZE
+    stp x0, x1,   [sp, #16 * 0]
+    stp x2, x3,   [sp, #16 * 1]
+    stp x4, x5,   [sp, #16 * 2]
+    stp x6, x7,   [sp, #16 * 3]
+    stp x8, x9,   [sp, #16 * 4]
+    stp x10, x11, [sp, #16 * 5]
+    stp x12, x13, [sp, #16 * 6]
+    stp x14, x15, [sp, #16 * 7]
+    stp x16, x17, [sp, #16 * 8]
+    stp x18, x19, [sp, #16 * 9]
+    stp x20, x21, [sp, #16 * 10]
+    stp x22, x23, [sp, #16 * 11]
+    stp x24, x25, [sp, #16 * 12]
+    stp x26, x27, [sp, #16 * 13]
+    stp x28, x29, [sp, #16 * 14]
+    mrs x10, sp_el0
+    mrs x11, elr_el1
+    mrs x12, spsr_el1
+    stp x30, x10, [sp, #16 * 15]
+    stp x11, x12, [sp, #16 * 16]
+.endm
+```
+
+相反地，exception_exit 用来恢复异常上下文，代码如下：
+
+```s
+.macro exception_exit
+    ldp x11, x12, [sp, #16 * 16]
+    ldp x30, x10, [sp, #16 * 15]
+    msr sp_el0, x10
+    msr elr_el1, x11
+    msr spsr_el1, x12
+    ldp x0, x1,   [sp, #16 * 0]
+    ldp x2, x3,   [sp, #16 * 1]
+    ldp x4, x5,   [sp, #16 * 2]
+    ldp x6, x7,   [sp, #16 * 3]
+    ldp x8, x9,   [sp, #16 * 4]
+    ldp x10, x11, [sp, #16 * 5]
+    ldp x12, x13, [sp, #16 * 6]
+    ldp x14, x15, [sp, #16 * 7]
+    ldp x16, x17, [sp, #16 * 8]
+    ldp x18, x19, [sp, #16 * 9]
+    ldp x20, x21, [sp, #16 * 10]
+    ldp x22, x23, [sp, #16 * 11]
+    ldp x24, x25, [sp, #16 * 12]
+    ldp x26, x27, [sp, #16 * 13]
+    ldp x28, x29, [sp, #16 * 14]
+    add sp, sp, #ARCH_EXEC_CONT_SIZE
+    eret
+.endm
+```
+
+SysCall 代码如下：
+
+```s
+el0_syscall:
+    sub sp, sp, #16 * 8
+    stp x0, x1,   [sp, #16 * 0]
+    stp x2, x3,   [sp, #16 * 1]
+    stp x4, x5,   [sp, #16 * 2]
+    stp x6, x7,   [sp, #16 * 3]
+    stp x8, x9,   [sp, #16 * 4]
+    stp x10, x11, [sp, #16 * 5]
+    stp x12, x13, [sp, #16 * 6]
+    stp x14, x15, [sp, #16 * 7]
+    bl lock_kernel
+    ldp x0, x1,   [sp, #16 * 0]
+    ldp x2, x3,   [sp, #16 * 1]
+    ldp x4, x5,   [sp, #16 * 2]
+    ldp x6, x7,   [sp, #16 * 3]
+    ldp x8, x9,   [sp, #16 * 4]
+    ldp x10, x11, [sp, #16 * 5]
+    ldp x12, x13, [sp, #16 * 6]
+    ldp x14, x15, [sp, #16 * 7]
+    add sp, sp, #16 * 8
+    adr x27, syscall_table
+    uxtw x16, w8
+    ldr x16, [x27, x16, lsl #3]
+    blr x16
+    /* Ret from syscall */
+    str x0, [sp]
+    bl unlock_kernel
+```
+
+# 内存管理
+
+## 虚拟内存管理
+
+
+
+## 物理内存管理
+
+
+
 
