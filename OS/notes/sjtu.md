@@ -1717,7 +1717,7 @@ heap_start ------------------------- new_heap_end
 3 → $2^3=8$ 页 → 32 KiB
 … → … → …
 
-OS 给所有的 order 维护一条**空闲链表**：
+不同的 order 对应各自的**空闲链表**（一个空闲块通常将其**首个物理页的描述符**加入空闲链表，其余物理页不必重复加入）：
 
 free_area[0]：所有 1 页的空闲块
 free_area[1]：所有 2 页的空闲块
@@ -1727,7 +1727,7 @@ free_area[3]：所有 8 页的空闲块
 
 申请 $2^k$ 个物理页时，首先检查 free_area[k]：
 
-1. 如果该链表中**存在空闲块**，取出一个即可；
+1. 如果该链表中有剩余**空闲块**，取出一个即可；
 2. 如果不存在，则向高一级的 order 查找；
 3. 找到后将大块二分，直到得到 $2^k$ 个页的物理块；
 4. 将其中一半分配出去，另一半放回对应 order 的空闲链表。
@@ -1742,7 +1742,125 @@ free_area[3]：所有 8 页的空闲块
 
 最终分配其中 1 页，其余的 1 页块和 2 页块**分别放入**对应的空闲链表。
 
-#### Buddy 合并
+#### 初始化
+
+代码如下：
+
+```c
+struct physical_page {
+    int allocated;
+    int order;
+    list_node node;
+};
+
+list free_lists[BUDDY_MAX_ORDER];
+
+void init_buddy(struct physical_page *start_page,
+                u64 page_num)
+{
+    int order;
+    int index;
+    struct physical_page *page;
+    // step 1: initialize all physical page descriptors
+    for (index = 0; index < page_num; ++index) {
+        page = start_page + index;
+        // temporarily marked as assigned
+        page->allocated = 1;
+        page->order = 0;
+    }
+    // step 2: initialize all order's free lists
+    for (order = 0;
+         order < BUDDY_MAX_ORDER;
+         ++order) {
+        init_list(&(free_lists[order]));
+    }
+    // step 3: release page by page
+    for (index = 0; index < page_num; ++index) {
+        page = start_page + index;
+        buddy_free_pages(page);
+    }
+}
+```
+
+初始化时先把所有页标记成**已分配单页**，再逐页释放。这样所有的页**自底向上**逐步与其 Buddy 合并，最终形成尽可能大的**完整空闲块**。
+
+#### 分配
+
+申请 order 阶物理块，从目标 order 开始向上寻找首个非空链表，代码如下：
+
+```c
+struct physical_page *buddy_alloc_pages(u64 order)
+{
+    int cur_order;
+    struct list_head *free_list;
+    struct physical_page *page = NULL;
+    // start searching from the target order upwards
+    for (cur_order = order;
+         cur_order < BUDDY_MAX_ORDER;
+         ++cur_order) {
+        free_list = &(free_lists[cur_order]);
+        if (!list_empty(free_list)) {
+            // remove a block from the free list
+            page = get_one_entry(free_list);
+            break;
+        }
+    }
+    // all higher orders do not have free blocks
+    if (page == NULL)
+        return NULL;
+    // if the block found is too large, split it down to a lower level
+    page = split_page(order, cur_order, page);
+    page->allocated = 1;
+    return page;
+}
+```
+
+#### 拆分
+
+拆分时，将一个 order = k 的块拆成两个 order = k-1 的 Buddy，代码如下：
+
+```c
+struct physical_page *split_page(
+        int target_order,
+        int cur_order,
+        struct physical_page *page)
+{
+    while (cur_order > target_order) {
+        --cur_order;
+        // right half's first physical page descriptor
+        struct physical_page *buddy =
+            page + (1UL << cur_order);
+        buddy->allocated = 0;
+        buddy->order = cur_order;
+        // the right half is added to the corresponding free list
+        add_one_entry(&free_lists[cur_order],
+                      buddy);
+        // the left half continues to be split or ultimately allocated
+        page->order = cur_order;
+    }
+    return page;
+}
+```
+
+#### 释放
+
+```c
+void buddy_free_pages(struct physical_page *page)
+{
+    int order;
+    struct list_head *free_list;
+    // marked as available
+    page->allocated = 0;
+    // attempt to merge with Buddy hierarchically
+    page = merge_page(page);
+    // add the final block to the corresponding free list
+    order = page->order;
+    free_list = &(free_lists[order]);
+    add_one_entry(free_list, page);
+}
+```
+
+#### 合并
 
 Buddy 块不用通过向左、向右遍历来查找，可以通过异或得到：
 
@@ -1760,17 +1878,57 @@ $$
 
 $$buddy_{addr} = addr \oplus (1UL << (12 + order))$$
 
-也就是说：两个 Buddy 的物理地址在二进制中**仅有一位不同**，这一位就是表示 “当前块大小” 的那一位。常见地，由于物理页框号 PFN 已去除了 4 KiB 页内偏移：
-
-$$
-PFN=\frac{\text{物理地址}}{4\text{ KiB}}
-$$
-
-对应的公式转化成：
+也就是说：两个 Buddy 的物理地址在二进制中**仅有一位不同**，这一位就是表示 “当前块大小” 的那一位。常见地，由于物理页框号 PFN 已去除了 4 KiB 页内偏移，所以：
 
 $$buddy_{pfn} = pfn \oplus (1UL << order)$$
 
-比如，order = 1 表示一个块包含 2 页，当前块 PFN 等于 4：$4 \oplus (1 << 1) = 6$。因此 PFN 4～5 与 PFN 6～7 是两个 order 1 的 Buddy，二者可以合并成 PFN 4～7 的 16 KiB 块。
+比如，order = 1 表示一个块包含 2 页，当前块 PFN 等于 4，$4 \oplus (1 << 1) = 6$。因此 PFN 4～5 与 PFN 6～7 是两个 order 等于 1 的 Buddy，二者可以合并成 PFN 4～7 的 16 KiB 块。
+
+代码如下：
+
+```c
+struct physical_page *merge_page(
+        struct physical_page *page)
+{
+    while (page->order + 1 < BUDDY_MAX_ORDER) {
+        u64 order = page->order;
+        // PFN
+        u64 pfn = page - physical_page_array;
+        // Buddy PFN
+        u64 buddy_pfn =
+            pfn ^ (1UL << order);
+        struct physical_page *buddy =
+            physical_page_array + buddy_pfn;
+        // buddy has been allocated, cannot be merged
+        if (buddy->allocated)
+            break;
+        // buddy sizes differ, cannot be merged
+        if (buddy->order != order)
+            break;
+        // buddy was originally in the free list of the current order
+        delete_one_entry(&free_lists[order], buddy);
+        // use the smaller addr as the header after merging
+        if (buddy_pfn < pfn)
+            page = buddy;
+        page->order = order + 1;
+    }
+    return page;
+}
+```
+
+### SLUB 分配器
+
+内核中常申请几十 B、几百 B 的小对象。如果申请一整页，将造成大量内部碎片。因此，**SLUB 分配器**专门来维护这些小对象。核心思想：先向 Buddy System 申请一个或多个物理页，组成一个 slab，再把 slab 划分成多个大小相同的 object，一个 object 对应一个具体的内核对象。
+
+#### freelist
+
+slab 内部通常有一条 freelist 记录空闲 object。由于空闲 object 本身**没有记录任何有效值**，因此可以利用 object 内部的一部分空间记录下一个空闲 object 的地址。
+
+freelist
+   ↓
+object A → object D → object F → NULL
+
+分配时，从 freelist 头部取出一个 object；释放时，再将 object 插回 freelist。因此，SLUB 的分配和释放理想情况 O(1)。
 
 
 
