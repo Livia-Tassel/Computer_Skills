@@ -1948,4 +1948,150 @@ object A → object D → object F → NULL
 
 # 进程
 
+## 初始化
+
+### 初始化 PCB
+
+PCB 放在内核态，用户态不能访问，一个简化的 PCB 可以写成：
+
+```c
+struct process {
+    int pid;
+    enum process_state state;
+
+    struct context *ctx;
+    struct vmspace *vmspace;
+    void *kernel_stack_base;
+    void *kernel_stack_top;
+
+    /* scheduling information */
+    int priority;
+    int time_slice;
+    struct list_node ready_node;
+
+    /* process relationships */
+    struct process *parent;
+    struct list children;
+
+    struct file_table *files;
+};
+```
+
+而初始化 PCB 常包含以下内容：
+
+* 初始化**虚拟地址空间 vmspace**；
+* 分配并初始化**顶级页表**；
+* 分配并初始化**内核栈**。
+
+```c
+struct process *new_proc = alloc_process();
+init_vmspace(new_proc->vmspace);
+new_proc->vmspace->pgtbl = alloc_page();
+init_kern_stack(new_proc->stack);
+```
+
+### 映射可执行文件
+
+<div align="center">
+  <img src="sjtu.assets/pcb-init-elf.png"
+  width="100%">
+</div>
+
+由传入的 ELF 可执行文件，将代码段等映射到新进程的虚拟地址空间：
+
+```c
+struct file *file = load_elf_file(path);
+for (struct seg loadable_seg : file->segs)
+    vmspace_map(new_proc->vmspace, loadable_seg);
+```
+
+### 初始化相关环境
+
+<div align="center">
+  <img src="sjtu.assets/pcb-init-stack.png"
+  width="100%">
+</div>
+
+将**用户栈映射**到虚拟地址空间，随后把命令行 argv 和环境 envp 放到用户栈中：
+
+```c
+void *stack = alloc_stack(STACKSIZE);
+vmspace_map(new_proc->vmspace, stack);
+prepare_env(stack, argv, envp);
+```
+
+### 初始化 CPU 上下文
+
+<div align="center">
+  <img src="sjtu.assets/pcb-init-ctx.png"
+  width="100%">
+</div>
+
+CPU 上下文初始化依赖前面的部分操作。比如，当代码段映射好后才知道 PC 指向的入口地址。所以 CPU 上下文初始化放到最后完成，包括：
+
+* PC；
+* SP；
+* **状态**寄存器；
+* **通用**寄存器。
+
+```c
+init_process_ctx(new_proc->ctx);
+```
+
+## 退出与等待
+
+一个简化的退出流程如下：
+
+```c
+void process_exit_v1(void)
+{
+    destroy_ctx(curr_proc->ctx);
+    destroy_kern_stack(curr_proc->stack);
+    destroy_vmspace(curr_proc->vmspace);
+    destroy_process(curr_proc);
+
+    /* select the next process to run */
+    schedule();
+}
+```
+
+注意，process_exit() 成功后不返回，schedule() 从**就绪队列**中选择下一个执行。且**部分资源** exit 后并不立刻释放，比如部分 PCB、PID、退出状态码、部分内核栈等，他们在**父**进程**执行 wait() 后**，或由其他内核执行流回收。
+
+```c
+void process_waitpid_v3(int id, int *status)
+{
+    /* current process has no child processes, return directly */
+    if (!curr_proc->children)
+        return;
+
+    while (TRUE) {
+        bool not_exist = TRUE;
+
+        /* scan the subprocess list of the current process */
+        for (struct process *proc : curr_proc->children) {
+            if (proc->pid == id) {
+                not_exist = FALSE;
+
+                if (proc->is_exit) {
+                    /* read the exit status of the subprocess */
+                    *status = proc->exit_status;
+
+                    /* recycle the remaining PCB resources */
+                    destroy_process(proc);
+                    return;
+                } else {
+                    /* child process has not exited, temporarily yielding CPU */
+                    schedule();
+                }
+            }
+        }
+
+        if (not_exist)
+            return;
+    }
+}
+```
+
+## 状态
+
 
