@@ -1930,5 +1930,22 @@ object A → object D → object F → NULL
 
 分配时，从 freelist 头部取出一个 object；释放时，再将 object 插回 freelist。因此，SLUB 的分配和释放理想情况 O(1)。
 
+### 换页机制
+
+常见的换页机制包括：
+
+* OPT
+* FIFO
+* Second Chance
+* Clock
+* LRU
+* LFU
+* NRU
+* 工作集（Working Set）
+* 工作集时钟（WSClock）
+
+当进程分配到的物理页无法容纳当前工作集时，将**频繁发生页面换入换出**，这种现象称作 Thrashing（抖动）。工作集模型通过尽量让进程当前用的页面同时留下，降低抖动的概率。
+
+# 进程
 
 
