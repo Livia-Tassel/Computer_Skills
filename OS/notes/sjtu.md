@@ -2092,6 +2092,83 @@ void process_waitpid_v3(int id, int *status)
 }
 ```
 
-## 状态
+## 切换
+
+一个简化的 schedule() 可以写成：
+
+```c
+void schedule(void)
+{
+    struct process *prev;
+    struct process *next;
+    /* save the currently running process */
+    prev = curr_proc;
+    /* select the next runnable process */
+    next = pick_next_process();
+    /* no runnable process is available */
+    if (next == NULL)
+        next = idle_process;
+    /* continue running the current process */
+    if (next == prev)
+        return;
+
+    /* update process states */
+    if (prev->state == PROCESS_RUNNING)
+        prev->state = PROCESS_READY;
+    next->state = PROCESS_RUNNING;
+    /* update the current process pointer */
+    curr_proc = next;
+    /* switch to the next process address space */
+    switch_vmspace(next->vmspace);
+    /* switch CPU context and kernel stack */
+    switch_context(prev->ctx, next->ctx);
+}
+```
+
+其中，**切虚拟地址空间**时将新进程的顶级页表地址写入 TTBR0_EL1：
+
+```c
+void switch_vmspace(struct vmspace *vmspace)
+{
+    write_ttbr0_el1(vmspace->pgtbl);
+    isb();
+}
+```
+
+**切内核栈**代码如下：
+
+```s
+switch_context:
+    // save the old process context
+    stp x19, x20, [x0, #0]
+    stp x21, x22, [x0, #16]
+    stp x23, x24, [x0, #32]
+    stp x25, x26, [x0, #48]
+    stp x27, x28, [x0, #64]
+    stp x29, x30, [x0, #80]
+    mov x2, sp
+    str x2, [x0, #96]
+    // restore the new process context
+    ldp x19, x20, [x1, #0]
+    ldp x21, x22, [x1, #16]
+    ldp x23, x24, [x1, #32]
+    ldp x25, x26, [x1, #48]
+    ldp x27, x28, [x1, #64]
+    ldp x29, x30, [x1, #80]
+    ldr x2, [x1, #96]
+    mov sp, x2
+    ret
+```
+
+注意，这里已进入内核态，sp 指 SP_EL1。而 x0~x30、SP_EL0、ELR_EL1 等异常上下文早就在**陷入内核态时压到**了对应的内核栈中。
+
+## 线程
+
+> **线程**仅含运行时的最小状态（寄存器和栈），静态部分由对应的进程提供。一个进程可以包含多个线程，所有线程的虚拟地址空间相同，可以在不同核并行。
+
+<div align="center">
+  <img src="sjtu.assets/multithreaded-address-space.png"
+  width="30%">
+</div>
 
 
