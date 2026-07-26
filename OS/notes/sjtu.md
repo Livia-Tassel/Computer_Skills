@@ -2171,4 +2171,67 @@ switch_context:
   width="30%">
 </div>
 
+### TCB
+
+```c
+struct process {
+    struct vmspace *vmspace;       // process shared virtual address space
+    ...
+    struct list_head thread_list;  // threads included in the process
+};
+
+struct thread {
+    struct thread_ctx *thread_ctx; // thread's own execution context
+    struct process *process;       // point to the owning process
+    struct ipc_connection *active_conn;
+    struct server_ipc_config *server_ipc_config;
+    ...
+};
+```
+
+<div align="center">
+  <img src="sjtu.assets/thread-address-space.png"
+  width="100%">
+</div>
+
+### thread_create()
+
+```c
+int thread_create(struct process *process,
+                  u64 stack,
+                  u64 pc,
+                  u64 arg);{
+    struct thread *thread;
+    thread = obj_alloc(TYPE_THREAD, sizeof(*thread));
+    thread->thread_ctx = create_thread_ctx();
+    init_thread_ctx(thread, stack, pc);
+    list_add(&thread->node, &process->thread_list);
+    arch_set_thread_arg(thread, arg);
+}
+```
+
+### thread_deinit()
+
+```c
+void thread_deinit(void *thread_ptr)
+{
+    bool exit_process = false;
+    struct thread *thd = thread_ptr;
+    struct process *process = thd->process;
+    list_del(&thd->node);
+    if (list_empty(&process->thread_list))
+        exit_process = true;
+    destroy_thread_ctx(thd);
+    if (exit_process)
+        process_exit(process);
+}
+```
+
+## 调度
+
+> 周转时间：请求**进入到执行结束**的时间
+> 响应时间：请求**进入到首次输出**的时间
+
+### FCFS
+
 
