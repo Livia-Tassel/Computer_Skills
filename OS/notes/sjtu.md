@@ -2274,7 +2274,116 @@ First Come First Serve，缺点：
   width="100%">
 </div>
 
-## 通信
+## IPC
+
+### 简单 IPC
+
+#### 发送
+
+发送者先获得一条 Channel，并构造消息、发送：
+
+```c
+int main(void)
+{
+    Message msg;
+    /* establish a communication connection between the sender and receiver */
+    Channel chan = simple_ipc_channel(...);
+    /* construct request messages according to the communication protocol */
+    msg = construct_request(...);
+    /* send messages through communication connections */
+    Send(chan, &msg);
+    ...
+}
+```
+
+#### 接收
+
+接收者常轮询等待消息到来，收到消息后再往下执行：
+
+```c
+int main(void)
+{
+    Message msg;
+    Channel chan = simple_ipc_channel(...);
+
+    while (1) {
+        /* waiting and receiving messages */
+        Recv(chan, &msg);
+        /* handle message */
+        results = handle_msg(&msg);
+        ...
+    }
+}
+```
+
+#### 远程调用
+
+普通的 Send() 把消息发送出去，不在意收到的回复。而**远程调用 RPC** 的发送者在发送完消息后阻塞并等待回复：
+
+```c
+#include <simple-ipc.h>
+int main(void)
+{
+    Message req_msg;
+    Message resp_msg;
+    Channel chan = simple_ipc_channel(...);
+    /* construct request message */
+    req_msg = construct_request(...);
+    /* send request and block waiting for a reply */
+    RPC(chan, &req_msg, &resp_msg);
+    printf("The response is: %s",
+           msg_to_str(resp_msg));
+    ...
+}
+```
+
+#### 消息
+
+```c
+struct Message {
+    int magic;
+    int status;
+    int length;
+    char payload[500];
+};
+```
+
+`magic` 可以获取消息格式，`status` 可以表示消息空闲、正在写入或已完成，`length` 表示 Payload 中有效消息的大小，`payload` 即消息本体。
+
+<div align="center">
+  <img src="sjtu.assets/simple-ipc.png"
+  width="80%">
+</div>
+
+>注：以上 Message 的所有内容都放在一块**共享内存**中。收发者通过 “指针+偏移量” 来获取或写入消息。
+
+#### 轮询状态
+
+```c
+enum {
+    MSG_EMPTY,
+    MSG_WRITING,
+    MSG_READY
+};
+
+Sender:
+while (msg->status != MSG_EMPTY)
+    ;
+msg->status = MSG_WRITING;
+copy_message(msg);
+msg->status = MSG_READY;
+
+Receiver:
+while (msg->status != MSG_READY)
+    ;
+handle_message(msg);
+msg->status = MSG_EMPTY;
+```
+
+轮询又称**忙等**，即消息没来，CPU 也在执行循环，适合：
+
+* 等待时间非常短；
+* 对低延迟严苛；
+* 在不同 CPU 核上。
 
 
- 
