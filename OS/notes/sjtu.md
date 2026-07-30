@@ -2386,4 +2386,69 @@ msg->status = MSG_EMPTY;
 * 对低延迟严苛；
 * 在不同 CPU 核上。
 
+### 管道
+
+管道由**内核管理**，收/发者各持有管道的 R/W 端，即半双工通信。
+
+```shell
+ls | grep *
+cat *.txt | grep *
+```
+
+以上两个命令表示将 ls/cat 的输出流向 grep，当做 grep 的输入；grep 再打印输出到屏幕上。
+
+```shell
+ls | grep * > result.txt
+cat *.txt | grep * | sort | uniq
+```
+
+还可以再将 grep 的输出写入到文件或传入下一个管道。
+
+### 共享内存
+
+**循环队列**：
+
+```c
+#define BUFFER_SIZE 10
+typedef struct {
+    ...
+} item;
+
+item buffer[BUFFER_SIZE];
+volatile int buffer_write_cnt = 0;
+volatile int buffer_read_cnt = 0;
+volatile int empty_slot = BUFFER_SIZE;
+volatile int filled_slot = 0;
+```
+
+发送者：
+
+```c
+while (new_package) {
+    item msg = produce_item();
+    while (empty_slot == 0)
+        ;
+
+    empty_slot--;
+    buffer[buffer_write_cnt] = msg;
+    buffer_write_cnt = (buffer_write_cnt + 1) % BUFFER_SIZE;
+    filled_slot++;
+}
+```
+
+接收者：
+
+```c
+while (wait_package) {
+    while (filled_slot == 0)
+        ;
+
+    filled_slot--;
+    item result = buffer[buffer_read_cnt];
+    buffer_read_cnt = (buffer_read_cnt + 1) % BUFFER_SIZE;
+    empty_slot++;
+    handle_item(result);
+}
+```
+
 
