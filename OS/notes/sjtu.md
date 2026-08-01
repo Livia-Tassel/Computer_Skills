@@ -2451,4 +2451,190 @@ while (wait_package) {
 }
 ```
 
+### 消息队列
+
+任何**有权限的进程**都可以访问消息队列，因此一个队列可以同时服务多个发送者和多个接收者。
+
+#### 消息与队列
+
+在 System V 消息队列中，消息常写成：
+
+```c
+struct message {
+    long msg_type;
+    char data[128];
+};
+```
+
+其中 msg_type 表示消息类型，比如：
+
+类型 1：普通消息
+类型 2：控制消息
+类型 3：错误消息
+
+消息队列中的消息在内核中以**链表形式**排列，新消息常被添加到队列尾部，因此在**不指定类型**的情况下，消息队列遵循 FIFO，即默认取队首消息。也可以通过 msgrcv() **接收特定类型**的消息：
+
+类型等于 0，即默认遵循 FIFO：
+
+队列：type=100 → type=200 → type=100
+取 type=0：取出最前面的 type=100
+
+类型大于 0，取队列中首条类型等于该值的消息：
+
+队列：type=100 → type=200 → type=100
+取 type=200：取出中间的 type=200
+
+#### ftok()
+
+```c
+key_t ftok(const char *pathname, int proj_id);
+```
+
+ftok() 由一个**文件路径**和一个 **ID** 生成 IPC key，发送者和接收者如果 pathname + proj_id 相同，就可以得到相同的 key，从而进入同一个消息队列。
+
+#### msgget()
+
+```c
+int msgget(key_t key, int msgflg);
+```
+
+比如：`int msgid = msgget(key, 0666 | IPC_CREAT);`，其中 0666 表示消息队列的访问权限。返回消息队列的标识符 msgid，以后**发送、接收和删除**消息都由它完成。
+
+#### msgsnd()
+
+消息发送：
+
+```c
+int msgsnd(
+    int msqid,
+    const void *msgp,
+    size_t msgsz,
+    int msgflg
+);
+```
+
+比如：
+
+```c
+struct message {
+    long msg_type;
+    char data[128];
+};
+
+struct message message;
+message.msg_type = 1;
+strcpy(message.data, "Hello");
+msgsnd(
+    msgid,
+    &message,
+    sizeof(message.data),
+    0
+);
+```
+
+#### msgrcv()
+
+消息接收：
+
+```c
+ssize_t msgrcv(
+    int msqid,
+    void *msgp,
+    size_t msgsz,
+    long msgtyp,
+    int msgflg
+);
+```
+
+比如：
+
+```c
+msgrcv(
+    msgid,
+    &message,
+    sizeof(message.data),
+    1,
+    0
+);
+```
+
+消息接收成功后，常**从消息队列中移除**，而不仅仅复制一份。
+
+#### msgctl()
+
+控制或删除消息队列：
+
+```c
+int msgctl(
+    int msqid,
+    int cmd,
+    struct msqid_ds *buf
+);
+```
+
+比如：`msgctl(msgid, IPC_RMID, NULL);`，其中 IPC_RMID 表示删除消息队列。
+
+# 同步原语
+
+## 竞争条件
+
+当多个**线程**并发访问同一份 data，且有一个执行写操作时，最终结果可能依赖这些执行流的**具体执行顺序**，该现象称竞争条件（Race Condition），也称**竞争冒险或竞态条件**。
+
+比如 3 个**线程**都执行以下代码，即执行若干次 a++：
+
+```c
+unsigned long a = 0;
+void *routine(void *arg)
+{
+    for (int i = 0; i < 1000000000; ++i) {
+        a++;
+    }
+    return NULL;
+}
+```
+
+理论上 a 等于 30 亿，但最终结果常小于 30 亿，原因在于 a++ 非一个原子操作，拆成汇编大致：
+
+```s
+reg_a = a;
+reg_a = reg_a + 1;
+a = reg_a;
+```
+
+## 临界区
+
+临界区（Critical Section）指不能被**多个线程同时执行**的一段代码。临界区的三个条件：
+
+1. 互斥访问
+2. 有限等待
+3. 空闲让进
+
+## 互斥锁
+
+**互斥锁将临界区锁住**，同一时刻只有一个**线程**持有锁：
+
+```c
+lock(&lock_object);
+/* Critical section. */
+unlock(&lock_object);
+```
+
+比如：
+
+```c
+lock(&buffer_lock);
+buffer[bufCnt % BUFFER_SIZE] = item;
+bufCnt = bufCnt + 1;
+unlock(&buffer_lock);
+```
+
+如果一个**线程**一直拿不到锁，可能忙等循环，称作**自旋锁**，所以**互斥锁不符合**有限等待的条件：
+
+```c
+while (!try_lock(lock)) {
+}
+```
+
+## 条件变量
+
 
