@@ -2637,4 +2637,320 @@ while (!try_lock(lock)) {
 
 ## 条件变量
 
+条件变量（Condition Variable）让线程在某个条件不符合时**主动睡眠**，在条件符合时被**唤醒**，从而防止轮询造成的 CPU 空转。
+
+比如：
+
+```c
+// Producer
+while (true) {
+    item new_msg = produce_new();
+    lock(&empty_slot_lock);
+    while (empty_slot == 0) {
+        cond_wait(&empty_cond, &empty_slot_lock);
+    }
+    empty_slot--;
+    unlock(&empty_slot_lock);
+    buffer_add(new_msg);
+}
+
+// Consumer
+while (true) {
+    lock(&filled_slot_lock);
+    while (filled_slot == 0) {
+        cond_wait(&filled_cond, &filled_slot_lock);
+    }
+    filled_slot--;
+    unlock(&filled_slot_lock);
+    item msg = buffer_remove();
+    lock(&empty_slot_lock);
+    empty_slot++;
+    cond_signal(&empty_cond);
+    unlock(&empty_slot_lock);
+    handle_item(msg);
+}
+```
+
+注意 `empty_slot` 不是条件变量，它可以视作一种**资源**；`empty_cond` 才是**条件变量**，本质一条 “等待队列+相关操作”；`empty_slot_lock` 是资源的锁。
+
+### cond_wait()
+
+```c
+struct cond {
+    struct wait_queue waiters;
+    struct spinlock waiters_lock;
+};
+
+void cond_wait(struct cond *cond, struct lock *mutex)
+{
+    struct thread *current = get_current_thread();
+    // protect the condition variable's wait queue
+    spin_lock(&cond->waiters_lock);
+    wait_queue_push(&cond->waiters, current);
+    mutex_unlock_and_block(
+        mutex,
+        &cond->waiters_lock
+    );
+    lock(mutex);
+}
+
+void mutex_unlock_and_block(struct lock *mutex, struct spinlock *waiters_lock)
+{
+    unlock(mutex);
+    set_current_thread_state(THREAD_BLOCKED);
+    spin_unlock(waiters_lock);
+    schedule();
+}
+```
+
+cond_wait() 将完成三件事：
+
+1. 将当前线程加入条件变量的**等待队列**；
+2. **释放**传入的**互斥锁**，**睡眠**当前线程；
+3. 未来**唤醒**后，**重新**获得该**互斥锁**，最后才从 cond_wait() 返回。
+
+注意 `block_current_and_unlock()` 必须原子地完成 “睡眠和释放锁”。
+
+### cond_signal()
+
+```c
+void cond_signal(struct cond *cond)
+{
+    spin_lock(&cond->waiters_lock);
+    if (!wait_queue_empty(&cond->waiters)) {
+        struct thread *thread;
+        thread = wait_queue_pop(&cond->waiters);
+        wakeup_thread(thread);
+    }
+    spin_unlock(&cond->waiters_lock);
+}
+```
+
+## 信号量
+
+两个原子操作：
+
+- P 操作：等待并消耗一个资源；
+- V 操作：增加一个资源并唤醒等待者。
+
+```c
+struct semaphore {
+    int count;
+    struct wait_queue waiters;
+    struct spinlock lock;
+};
+```
+
+> `count` 表示**剩余的资源量**。
+
+比如：
+
+```c
+struct semaphore empty_slots;
+struct semaphore filled_slots;
+struct lock buffer_lock;
+
+sem_init(&empty_slots, BUFFER_SIZE);
+sem_init(&filled_slots, 0);
+lock_init(&buffer_lock);
+
+// Producer
+while (true) {
+    item new_msg = produce_new();
+    sem_wait(&empty_slots);
+    lock(&buffer_lock);
+    buffer_add(new_msg);
+    unlock(&buffer_lock);
+    sem_signal(&filled_slots);
+}
+
+// Consumer
+while (true) {
+    item msg;
+    sem_wait(&filled_slots);
+    lock(&buffer_lock);
+    msg = buffer_remove();
+    unlock(&buffer_lock);
+    sem_signal(&empty_slots);
+    handle_item(msg);
+}
+```
+
+### 初始化
+
+```c
+void sem_init(struct semaphore *sem, int initial_count)
+{
+    sem->count = initial_count;
+    wait_queue_init(&sem->waiters);
+    spinlock_init(&sem->lock);
+}
+```
+
+### P 操作：sem_wait()
+
+```c
+void sem_wait(struct semaphore *sem)
+{
+    struct thread *current;
+    spin_lock(&sem->lock);
+
+    // a resource is available
+    if (sem->count > 0) {
+        sem->count--;
+        spin_unlock(&sem->lock);
+        return;
+    }
+    // no resource is available
+    current = get_current_thread();
+    wait_queue_push(&sem->waiters, current);
+    block_current_and_unlock(&sem->lock);
+}
+
+void block_current_and_unlock(struct spinlock *lock)
+{
+    struct thread *current;
+    current = get_current_thread();
+    current->state = THREAD_BLOCKED;
+    spin_unlock(lock);
+    schedule();
+}
+```
+
+### V 操作：sem_signal()
+
+```c
+void sem_signal(struct semaphore *sem)
+{
+    struct thread *thread;
+    spin_lock(&sem->lock);
+
+    if (!wait_queue_empty(&sem->waiters)) {
+        thread = wait_queue_pop(&sem->waiters);
+        wakeup_thread(thread);
+        spin_unlock(&sem->lock);
+        return;
+    }
+
+    sem->count++;
+    spin_unlock(&sem->lock);
+}
+```
+
+## RW 锁
+
+```c
+struct rwlock {
+    struct lock lock;
+    struct cond readers_cond;
+    struct cond writers_cond;
+    int active_readers;
+    int waiting_writers;
+    bool writer_active;
+};
+
+struct rwlock *lock;
+char data[SIZE];
+
+void reader(void)
+{
+    lock_reader(lock);
+    read_data(data);
+    unlock_reader(lock);
+}
+
+void writer(void)
+{
+    lock_writer(lock);
+    update_data(data);
+    unlock_writer(lock);
+}
+```
+
+### 初始化
+
+```c
+void rwlock_init(struct rwlock *rw)
+{
+    lock_init(&rw->lock);
+    cond_init(&rw->readers_cond);
+    cond_init(&rw->writers_cond);
+    rw->active_readers = 0;
+    rw->waiting_writers = 0;
+    rw->writer_active = false;
+}
+```
+
+### R 操作
+
+```c
+void lock_reader(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    // writer-biased rwlock 
+    while (rw->writer_active || rw->waiting_writers > 0) {
+        cond_wait(&rw->readers_cond, &rw->lock);
+    }
+    // reader-biased rwlock
+    while (rw->writer_active) {
+    cond_wait(&rw->readers_cond, &rw->lock);
+    }
+    rw->active_readers++;
+    unlock(&rw->lock);
+}
+
+void unlock_reader(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    rw->active_readers--;
+    if (rw->active_readers == 0) {
+        cond_signal(&rw->writers_cond);
+    }
+    unlock(&rw->lock);
+}
+```
+
+### W 操作
+
+```c
+void lock_writer(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    rw->waiting_writers++;
+    while (rw->writer_active || rw->active_readers > 0) {
+        cond_wait(&rw->writers_cond, &rw->lock);
+    }
+    rw->waiting_writers--;
+    rw->writer_active = true;
+    unlock(&rw->lock);
+}
+
+void unlock_writer(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    rw->writer_active = false;
+    if (rw->waiting_writers > 0) {
+        cond_signal(&rw->writers_cond);
+    } else {
+        cond_broadcast(&rw->readers_cond);
+    }
+    unlock(&rw->lock);
+}
+```
+
+## 死锁
+
+死锁的原因：
+
+1. 互斥访问
+2. 持有并等待
+3. 资源非抢占
+4. 循环等待
+
+### 检测与恢复
+
+### 预防
+
+### 避免
+
 
