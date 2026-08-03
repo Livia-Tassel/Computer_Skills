@@ -2580,7 +2580,7 @@ int msgctl(
 
 当多个**线程**并发访问同一份 data，且有一个执行写操作时，最终结果可能依赖这些执行流的**具体执行顺序**，该现象称竞争条件（Race Condition），也称**竞争冒险或竞态条件**。
 
-比如 3 个**线程**都执行以下代码，即执行若干次 a++：
+比如 3 个线程都执行以下代码，即执行若干次 a++：
 
 ```c
 unsigned long a = 0;
@@ -2634,6 +2634,176 @@ unlock(&buffer_lock);
 while (!try_lock(lock)) {
 }
 ```
+
+## 原子操作
+
+常见的**原子原语**包括：
+
+* Test-and-Set；
+* Compare-and-Swap；
+* Load-Linked / Store-Conditional；
+* Fetch-and-Add。
+
+### Test-and-Set
+
+```c
+int TestAndSet(int *ptr, int new_value)
+{
+    int old_value = *ptr;
+    *ptr = new_value;
+    return old_value;
+}
+```
+
+> 注意，上面的 C 代码**仅描述语义**。Test-and-Set 和后面几个操作的功能必须由**硬件原子指令完成**，不能真的拆成普通的代码。
+
+借助 TaS 后的自旋锁：
+
+```c
+typedef struct {
+    int flag;
+} lock_t;
+
+void lock_init(lock_t *lock)
+{
+    lock->flag = 0;
+}
+void lock(lock_t *lock)
+{
+    while (TestAndSet(&lock->flag, 1) == 1) {
+    }
+}
+void unlock(lock_t *lock)
+{
+    lock->flag = 0;
+}
+```
+
+如果 TestAndSet 返回 0，表示锁原来空闲，且现已把它改成 1，获锁成功；反之，TestAndSet 返回 1，表示锁原来已被占用，开始自旋。
+
+Test-Test-and-Set 优化
+
+> 仅观察到锁空闲时才真正执行 Test-and-Set，可以**降低写**操作量。
+
+```c
+void lock(lock_t *lock)
+{
+    while (true) {
+        while (lock->flag == 1) {
+        }
+        if (TestAndSet(&lock->flag, 1) == 0) {
+            return;
+        }
+    }
+}
+```
+
+### Compare-and-Swap
+
+```c
+int CompareAndSwap(int *ptr, int expected, int new_value)
+{
+    int actual = *ptr;
+    if (actual == expected) {
+        *ptr = new_value;
+    }
+    return actual;
+}
+```
+
+原理和优化后的 TaS 很像，即 TTaS。借助 CaS 后的自旋锁：
+
+```c
+void lock(lock_t *lock)
+{
+    while (CompareAndSwap(&lock->flag, 0, 1) == 1) {
+    }
+}
+```
+
+### Load-Linked / Store-Conditional
+
+```c
+int LoadLinked(int *ptr)
+{
+    return *ptr;
+}
+int StoreConditional(int *ptr, int value)
+{
+    if (no_other_thread_has_modified(ptr)) {
+        *ptr = value;
+        return 1;
+    }
+    return 0;
+}
+```
+
+注意 `no_other_thread_has_modified(ptr)` 由 CPU 的**独占监视器**完成。
+
+借助 LL/SC 后的自旋锁：
+
+```c
+void lock(lock_t *lock)
+{
+    while (true) {
+        while (LoadLinked(&lock->flag) == 1) {
+        }
+        if (StoreConditional(&lock->flag, 1) == 1) {
+            return;
+        }
+    }
+}
+```
+
+AArch64 中常**独占加载和独占存储**到达类似 LL/SC 的机制：
+
+```s
+ldaxr   w1, [x0]
+stxr    w2, w3, [x0]
+```
+
+### Fetch-and-Add
+
+```c
+int FetchAndAdd(int *ptr, int increment)
+{
+    int old = *ptr;
+    *ptr = old + increment;
+    return old;
+}
+```
+
+如果初始值等于 5，A、B 同时执行：FetchAndAdd(&value, 1)。**硬件自动将二者排出先后顺序**，比如 A 返回 5，value 等于 6；B 返回 6，value 等于 7。
+
+### Ticket Lock
+
+借助 FaD 后的排号锁：
+
+```c
+typedef struct {
+    int ticket; // next
+    int turn;   // cur
+} ticket_lock_t;
+
+void ticket_lock_init(ticket_lock_t *lock)
+{
+    lock->ticket = 0;
+    lock->turn = 0;
+}
+void ticket_lock(ticket_lock_t *lock)
+{
+    int my_turn;
+    my_turn = FetchAndAdd(&lock->ticket);
+    while (lock->turn != my_turn) {
+    }
+}
+void ticket_unlock(ticket_lock_t *lock)
+{
+    lock->turn = lock->turn + 1;
+}
+```
+
+Ticket Lock 公平，但依旧归于自旋锁一类。
 
 ## 条件变量
 
