@@ -2841,7 +2841,7 @@ while (true) {
 }
 ```
 
-注意 `empty_slot` 不是条件变量，它可以视作一种**资源**；`empty_cond` 才是**条件变量**，本质一条 “等待队列+相关操作”；`empty_slot_lock` 是资源的锁。
+注意 `empty_slot` 非条件变量，它可以视作一种**资源**；`empty_cond`：**条件变量**，本质一条 “等待队列+相关操作”；`empty_slot_lock`：资源的锁。
 
 ### cond_wait()
 
@@ -3028,7 +3028,6 @@ void reader(void)
     read_data(data);
     unlock_reader(lock);
 }
-
 void writer(void)
 {
     lock_writer(lock);
@@ -3063,7 +3062,7 @@ void lock_reader(struct rwlock *rw)
     }
     // reader-biased rwlock
     while (rw->writer_active) {
-    cond_wait(&rw->readers_cond, &rw->lock);
+        cond_wait(&rw->readers_cond, &rw->lock);
     }
     rw->active_readers++;
     unlock(&rw->lock);
@@ -3117,10 +3116,6 @@ void unlock_writer(struct rwlock *rw)
 3. 资源非抢占
 4. 循环等待
 
-### 检测与恢复
-
-### 预防
-
-### 避免
+# FS
 
 
