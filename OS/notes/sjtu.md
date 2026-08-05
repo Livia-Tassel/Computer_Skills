@@ -3118,4 +3118,87 @@ void unlock_writer(struct rwlock *rw)
 
 # FS
 
+<div align="center">
+  <img src="sjtu.assets/file-system.png"
+  width="50%">
+</div>
+
+## inode
+
+<div align="center">
+  <img src="sjtu.assets/inode.png"
+  width="70%">
+</div>
+
+一个 inode 常记录：
+
+* 文件类型；
+* 文件大小；
+* 所有者 UID 和 GID；
+* 访问权限；
+* 修改、访问时间；
+* **硬链接**计数；
+* 指向文件块的指针。
+
+### 多级 inode
+
+<div align="center">
+  <img src="sjtu.assets/multilevel-inode.png"
+  width="90%">
+</div>
+
+如果 inode 包含：
+
+* 12 个直接指针；
+* 3 个一级间接指针；
+* 1 个二级间接指针；
+
+则单个文件最大：
+
+$$
+(12+3\times512+512\times512)\times4\text{ KiB}=48\text{ KiB}+6\text{ MiB}+1\text{ GiB}
+$$
+
+### 目录
+
+一个**目录文件**包含：
+
+"program" → inode 10
+"paper"   → inode 12
+"notes"   → inode 25
+：
+
+目录文件的一行称作**目录项**，可以将**文件名**解析成 **inode 号**。
+
+### 文件查找
+
+比如查找 `/os-book/fs.tex`：
+
+<div align="center">
+  <img src="sjtu.assets/file-recursive-search.png"
+  width="90%">
+</div>
+
+### Link
+
+目录项 "a.txt" ─┐
+            ├── → inode 42 → 文件
+目录项 "b.txt" ─┘
+
+删除一个文件，仅**删除对应目录项**，并将 inode 的 `link_cnt--`。当 cnt = 0 时才真正释放 inode。
+
+限制：
+
+<div align="center">
+  <img src="sjtu.assets/link-loop.png"
+  width="30%">
+</div>
+
+> * 由于 inode 在不同 FS 中的唯一性，所以不能跨 FS；
+> * 不能 **Link 目录**，防止形成环形目录，除了 `.` 和 `..`；
+
+`Symbolic Link`：一个独立文件，有自己的 inode。
+
+## API
+
 
