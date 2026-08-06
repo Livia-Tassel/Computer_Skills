@@ -3199,6 +3199,35 @@ $$
 
 `Symbolic Link`：一个独立文件，有自己的 inode。
 
-## API
+## Fd
+
+<div align="center">
+  <img src="sjtu.assets/fd-table.png"
+  width="100%">
+</div>
+
+> fd：文件描述符，0、1、2 表示**标准输入**、**标准输出**和**标准错误**；所以普通文件的 fd 常从 3 开始。
+
+### 文件游标 File Cursor
+
+游标初始位于文件开头：offset = 0，执行 `write(fd, data, 13)` 成功写入 13B 后，文件游标自动移动到：offset = 13。此时再执行 `read(fd, buffer, 10)` 将从 13B 开始。
+
+lseek() 可以手动修改文件游标，比如：
+
+```c
+int fd = open("file.txt", O_RDWR | O_CREAT, 0664);
+const char *data = "hello, world\n";
+write(fd, data, strlen(data));
+// move the cursor back to the beginning of the file
+lseek(fd, 0, SEEK_SET);
+char buffer[1024] = {0};
+read(fd, buffer, sizeof(buffer));
+printf("%s", buffer);
+```
+
+# Device
+
+
+
 
 
