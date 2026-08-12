@@ -3227,7 +3227,23 @@ printf("%s", buffer);
 
 # Device
 
+## MMIO
 
+<div align="center">
+  <img src="sjtu.assets/mmio.png"
+  width="60%">
+</div>
 
+## IOMMU
 
+<div align="center">
+  <img src="sjtu.assets/iommu.png"
+  width="60%">
+</div>
 
+## GPU
+
+<div align="center">
+  <img src="sjtu.assets/gpu.png"
+  width="90%">
+</div>
