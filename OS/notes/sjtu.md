@@ -2092,6 +2092,1158 @@ void process_waitpid_v3(int id, int *status)
 }
 ```
 
-## 状态
+## 切换
 
+一个简化的 schedule() 可以写成：
 
+```c
+void schedule(void)
+{
+    struct process *prev;
+    struct process *next;
+    /* save the currently running process */
+    prev = curr_proc;
+    /* select the next runnable process */
+    next = pick_next_process();
+    /* no runnable process is available */
+    if (next == NULL)
+        next = idle_process;
+    /* continue running the current process */
+    if (next == prev)
+        return;
+
+    /* update process states */
+    if (prev->state == PROCESS_RUNNING)
+        prev->state = PROCESS_READY;
+    next->state = PROCESS_RUNNING;
+    /* update the current process pointer */
+    curr_proc = next;
+    /* switch to the next process address space */
+    switch_vmspace(next->vmspace);
+    /* switch CPU context and kernel stack */
+    switch_context(prev->ctx, next->ctx);
+}
+```
+
+其中，**切虚拟地址空间**时将新进程的顶级页表地址写入 TTBR0_EL1：
+
+```c
+void switch_vmspace(struct vmspace *vmspace)
+{
+    write_ttbr0_el1(vmspace->pgtbl);
+    isb();
+}
+```
+
+**切内核栈**代码如下：
+
+```s
+switch_context:
+    // save the old process context
+    stp x19, x20, [x0, #0]
+    stp x21, x22, [x0, #16]
+    stp x23, x24, [x0, #32]
+    stp x25, x26, [x0, #48]
+    stp x27, x28, [x0, #64]
+    stp x29, x30, [x0, #80]
+    mov x2, sp
+    str x2, [x0, #96]
+    // restore the new process context
+    ldp x19, x20, [x1, #0]
+    ldp x21, x22, [x1, #16]
+    ldp x23, x24, [x1, #32]
+    ldp x25, x26, [x1, #48]
+    ldp x27, x28, [x1, #64]
+    ldp x29, x30, [x1, #80]
+    ldr x2, [x1, #96]
+    mov sp, x2
+    ret
+```
+
+注意，这里已进入内核态，sp 指 SP_EL1。而 x0~x30、SP_EL0、ELR_EL1 等异常上下文早就在**陷入内核态时压到**了对应的内核栈中。
+
+## 线程
+
+> **线程**仅含运行时的最小状态（寄存器和栈），静态部分由对应的进程提供。一个进程可以包含多个线程，所有线程的虚拟地址空间相同，可以在不同核并行。
+
+<div align="center">
+  <img src="sjtu.assets/multithreaded-address-space.png"
+  width="30%">
+</div>
+
+### TCB
+
+```c
+struct process {
+    struct vmspace *vmspace;       // process shared virtual address space
+    ...
+    struct list_head thread_list;  // threads included in the process
+};
+
+struct thread {
+    struct thread_ctx *thread_ctx; // thread's own execution context
+    struct process *process;       // point to the owning process
+    struct ipc_connection *active_conn;
+    struct server_ipc_config *server_ipc_config;
+    ...
+};
+```
+
+<div align="center">
+  <img src="sjtu.assets/thread-address-space.png"
+  width="100%">
+</div>
+
+### thread_create()
+
+```c
+int thread_create(struct process *process,
+                  u64 stack,
+                  u64 pc,
+                  u64 arg);{
+    struct thread *thread;
+    thread = obj_alloc(TYPE_THREAD, sizeof(*thread));
+    thread->thread_ctx = create_thread_ctx();
+    init_thread_ctx(thread, stack, pc);
+    list_add(&thread->node, &process->thread_list);
+    arch_set_thread_arg(thread, arg);
+}
+```
+
+### thread_deinit()
+
+```c
+void thread_deinit(void *thread_ptr)
+{
+    bool exit_process = false;
+    struct thread *thd = thread_ptr;
+    struct process *process = thd->process;
+    list_del(&thd->node);
+    if (list_empty(&process->thread_list))
+        exit_process = true;
+    destroy_thread_ctx(thd);
+    if (exit_process)
+        process_exit(process);
+}
+```
+
+## Scheduling
+
+> 周转时间：请求**进入到执行结束**的时间
+> 响应时间：请求**进入到首次输出**的时间
+
+### FCFS
+
+First Come First Serve，缺点：
+- 平均**周转**时间、**响应**时间都过长
+
+### SJF
+
+短请求优先，平均周转时间短，但：
+- 对长请求不公平
+- 平均**响应**时间过长
+
+### RR
+
+时间片轮转，公平且平均响应时间短，但：
+- 平均**周转**时间过长
+
+### MLQ
+
+多个不同优先级的队列，高优先级的请求优先执行，同优先级的请求时间片轮转。通常以下类型的请求将获得高优先级：
+1. **I/O 密集型**请求
+2. **设置**的核心请求
+3. 对**时延严苛**的请求
+4. **等待时间过长**的请求
+
+### Lottery
+
+由不同请求的份额分配彩票占比，再随机出待执行的请求：
+
+<div align="center">
+  <img src="sjtu.assets/lottery.png"
+  width="50%">
+</div>
+
+### Stride
+
+请求**执行一次增加**与份额成反比的虚拟时间（步幅），从优先队列中选择虚拟时间最少的请求执行：
+
+<div align="center">
+  <img src="sjtu.assets/stride.png"
+  width="100%">
+</div>
+
+## IPC
+
+### 简单 IPC
+
+#### 发送
+
+发送者先获得一条 Channel，并构造消息、发送：
+
+```c
+int main(void)
+{
+    Message msg;
+    /* establish a communication connection between the sender and receiver */
+    Channel chan = simple_ipc_channel(...);
+    /* construct request messages according to the communication protocol */
+    msg = construct_request(...);
+    /* send messages through communication connections */
+    Send(chan, &msg);
+    ...
+}
+```
+
+#### 接收
+
+接收者常轮询等待消息到来，收到消息后再往下执行：
+
+```c
+int main(void)
+{
+    Message msg;
+    Channel chan = simple_ipc_channel(...);
+
+    while (1) {
+        /* waiting and receiving messages */
+        Recv(chan, &msg);
+        /* handle message */
+        results = handle_msg(&msg);
+        ...
+    }
+}
+```
+
+#### 远程调用
+
+普通的 Send() 把消息发送出去，不在意收到的回复。而**远程调用 RPC** 的发送者在发送完消息后阻塞并等待回复：
+
+```c
+#include <simple-ipc.h>
+int main(void)
+{
+    Message req_msg;
+    Message resp_msg;
+    Channel chan = simple_ipc_channel(...);
+    /* construct request message */
+    req_msg = construct_request(...);
+    /* send request and block waiting for a reply */
+    RPC(chan, &req_msg, &resp_msg);
+    printf("The response is: %s",
+           msg_to_str(resp_msg));
+    ...
+}
+```
+
+#### 消息
+
+```c
+struct Message {
+    int magic;
+    int status;
+    int length;
+    char payload[500];
+};
+```
+
+`magic` 可以获取消息格式，`status` 可以表示消息空闲、正在写入或已完成，`length` 表示 Payload 中有效消息的大小，`payload` 即消息本体。
+
+<div align="center">
+  <img src="sjtu.assets/simple-ipc.png"
+  width="80%">
+</div>
+
+>注：以上 Message 的所有内容都放在一块**共享内存**中。收发者通过 “指针+偏移量” 来获取或写入消息。
+
+#### 轮询状态
+
+```c
+enum {
+    MSG_EMPTY,
+    MSG_WRITING,
+    MSG_READY
+};
+
+Sender:
+while (msg->status != MSG_EMPTY)
+    ;
+msg->status = MSG_WRITING;
+copy_message(msg);
+msg->status = MSG_READY;
+
+Receiver:
+while (msg->status != MSG_READY)
+    ;
+handle_message(msg);
+msg->status = MSG_EMPTY;
+```
+
+轮询又称**忙等**，即消息没来，CPU 也在执行循环，适合：
+
+* 等待时间非常短；
+* 对低延迟严苛；
+* 在不同 CPU 核上。
+
+### 管道
+
+管道由**内核管理**，收/发者各持有管道的 R/W 端，即半双工通信。
+
+```shell
+ls | grep *
+cat *.txt | grep *
+```
+
+以上两个命令表示将 ls/cat 的输出流向 grep，当做 grep 的输入；grep 再打印输出到屏幕上。
+
+```shell
+ls | grep * > result.txt
+cat *.txt | grep * | sort | uniq
+```
+
+还可以再将 grep 的输出写入到文件或传入下一个管道。
+
+### 共享内存
+
+**循环队列**：
+
+```c
+#define BUFFER_SIZE 10
+typedef struct {
+    ...
+} item;
+
+item buffer[BUFFER_SIZE];
+volatile int buffer_write_cnt = 0;
+volatile int buffer_read_cnt = 0;
+volatile int empty_slot = BUFFER_SIZE;
+volatile int filled_slot = 0;
+```
+
+发送者：
+
+```c
+while (new_package) {
+    item msg = produce_item();
+    while (empty_slot == 0)
+        ;
+
+    empty_slot--;
+    buffer[buffer_write_cnt] = msg;
+    buffer_write_cnt = (buffer_write_cnt + 1) % BUFFER_SIZE;
+    filled_slot++;
+}
+```
+
+接收者：
+
+```c
+while (wait_package) {
+    while (filled_slot == 0)
+        ;
+
+    filled_slot--;
+    item result = buffer[buffer_read_cnt];
+    buffer_read_cnt = (buffer_read_cnt + 1) % BUFFER_SIZE;
+    empty_slot++;
+    handle_item(result);
+}
+```
+
+### 消息队列
+
+任何**有权限的进程**都可以访问消息队列，因此一个队列可以同时服务多个发送者和多个接收者。
+
+#### 消息与队列
+
+在 System V 消息队列中，消息常写成：
+
+```c
+struct message {
+    long msg_type;
+    char data[128];
+};
+```
+
+其中 msg_type 表示消息类型，比如：
+
+类型 1：普通消息
+类型 2：控制消息
+类型 3：错误消息
+
+消息队列中的消息在内核中以**链表形式**排列，新消息常被添加到队列尾部，因此在**不指定类型**的情况下，消息队列遵循 FIFO，即默认取队首消息。也可以通过 msgrcv() **接收特定类型**的消息：
+
+类型等于 0，即默认遵循 FIFO：
+
+队列：type=100 → type=200 → type=100
+取 type=0：取出最前面的 type=100
+
+类型大于 0，取队列中首条类型等于该值的消息：
+
+队列：type=100 → type=200 → type=100
+取 type=200：取出中间的 type=200
+
+#### ftok()
+
+```c
+key_t ftok(const char *pathname, int proj_id);
+```
+
+ftok() 由一个**文件路径**和一个 **ID** 生成 IPC key，发送者和接收者如果 pathname + proj_id 相同，就可以得到相同的 key，从而进入同一个消息队列。
+
+#### msgget()
+
+```c
+int msgget(key_t key, int msgflg);
+```
+
+比如：`int msgid = msgget(key, 0666 | IPC_CREAT);`，其中 0666 表示消息队列的访问权限。返回消息队列的标识符 msgid，以后**发送、接收和删除**消息都由它完成。
+
+#### msgsnd()
+
+消息发送：
+
+```c
+int msgsnd(
+    int msqid,
+    const void *msgp,
+    size_t msgsz,
+    int msgflg
+);
+```
+
+比如：
+
+```c
+struct message {
+    long msg_type;
+    char data[128];
+};
+
+struct message message;
+message.msg_type = 1;
+strcpy(message.data, "Hello");
+msgsnd(
+    msgid,
+    &message,
+    sizeof(message.data),
+    0
+);
+```
+
+#### msgrcv()
+
+消息接收：
+
+```c
+ssize_t msgrcv(
+    int msqid,
+    void *msgp,
+    size_t msgsz,
+    long msgtyp,
+    int msgflg
+);
+```
+
+比如：
+
+```c
+msgrcv(
+    msgid,
+    &message,
+    sizeof(message.data),
+    1,
+    0
+);
+```
+
+消息接收成功后，常**从消息队列中移除**，而不仅仅复制一份。
+
+#### msgctl()
+
+控制或删除消息队列：
+
+```c
+int msgctl(
+    int msqid,
+    int cmd,
+    struct msqid_ds *buf
+);
+```
+
+比如：`msgctl(msgid, IPC_RMID, NULL);`，其中 IPC_RMID 表示删除消息队列。
+
+# 同步原语
+
+## 竞争条件
+
+当多个**线程**并发访问同一份 data，且有一个执行写操作时，最终结果可能依赖这些执行流的**具体执行顺序**，该现象称竞争条件（Race Condition），也称**竞争冒险或竞态条件**。
+
+比如 3 个线程都执行以下代码，即执行若干次 a++：
+
+```c
+unsigned long a = 0;
+void *routine(void *arg)
+{
+    for (int i = 0; i < 1000000000; ++i) {
+        a++;
+    }
+    return NULL;
+}
+```
+
+理论上 a 等于 30 亿，但最终结果常小于 30 亿，原因在于 a++ 非一个原子操作，拆成汇编大致：
+
+```s
+reg_a = a;
+reg_a = reg_a + 1;
+a = reg_a;
+```
+
+## 临界区
+
+临界区（Critical Section）指不能被**多个线程同时执行**的一段代码。临界区的三个条件：
+
+1. 互斥访问
+2. 有限等待
+3. 空闲让进
+
+## 互斥锁
+
+**互斥锁将临界区锁住**，同一时刻只有一个**线程**持有锁：
+
+```c
+lock(&lock_object);
+/* Critical section. */
+unlock(&lock_object);
+```
+
+比如：
+
+```c
+lock(&buffer_lock);
+buffer[bufCnt % BUFFER_SIZE] = item;
+bufCnt = bufCnt + 1;
+unlock(&buffer_lock);
+```
+
+如果一个**线程**一直拿不到锁，可能忙等循环，称作**自旋锁**，所以**互斥锁不符合**有限等待的条件：
+
+```c
+while (!try_lock(lock)) {
+}
+```
+
+## 原子操作
+
+常见的**原子原语**包括：
+
+* Test-and-Set；
+* Compare-and-Swap；
+* Load-Linked / Store-Conditional；
+* Fetch-and-Add。
+
+### Test-and-Set
+
+```c
+int TestAndSet(int *ptr, int new_value)
+{
+    int old_value = *ptr;
+    *ptr = new_value;
+    return old_value;
+}
+```
+
+> 注意，上面的 C 代码**仅描述语义**。Test-and-Set 和后面几个操作的功能必须由**硬件原子指令完成**，不能真的拆成普通的代码。
+
+借助 TaS 后的自旋锁：
+
+```c
+typedef struct {
+    int flag;
+} lock_t;
+
+void lock_init(lock_t *lock)
+{
+    lock->flag = 0;
+}
+void lock(lock_t *lock)
+{
+    while (TestAndSet(&lock->flag, 1) == 1) {
+    }
+}
+void unlock(lock_t *lock)
+{
+    lock->flag = 0;
+}
+```
+
+如果 TestAndSet 返回 0，表示锁原来空闲，且现已把它改成 1，获锁成功；反之，TestAndSet 返回 1，表示锁原来已被占用，开始自旋。
+
+Test-Test-and-Set 优化
+
+> 仅观察到锁空闲时才真正执行 Test-and-Set，可以**降低写**操作量。
+
+```c
+void lock(lock_t *lock)
+{
+    while (true) {
+        while (lock->flag == 1) {
+        }
+        if (TestAndSet(&lock->flag, 1) == 0) {
+            return;
+        }
+    }
+}
+```
+
+### Compare-and-Swap
+
+```c
+int CompareAndSwap(int *ptr, int expected, int new_value)
+{
+    int actual = *ptr;
+    if (actual == expected) {
+        *ptr = new_value;
+    }
+    return actual;
+}
+```
+
+原理和优化后的 TaS 很像，即 TTaS。借助 CaS 后的自旋锁：
+
+```c
+void lock(lock_t *lock)
+{
+    while (CompareAndSwap(&lock->flag, 0, 1) == 1) {
+    }
+}
+```
+
+### Load-Linked / Store-Conditional
+
+```c
+int LoadLinked(int *ptr)
+{
+    return *ptr;
+}
+int StoreConditional(int *ptr, int value)
+{
+    if (no_other_thread_has_modified(ptr)) {
+        *ptr = value;
+        return 1;
+    }
+    return 0;
+}
+```
+
+注意 `no_other_thread_has_modified(ptr)` 由 CPU 的**独占监视器**完成。
+
+借助 LL/SC 后的自旋锁：
+
+```c
+void lock(lock_t *lock)
+{
+    while (true) {
+        while (LoadLinked(&lock->flag) == 1) {
+        }
+        if (StoreConditional(&lock->flag, 1) == 1) {
+            return;
+        }
+    }
+}
+```
+
+AArch64 中常**独占加载和独占存储**到达类似 LL/SC 的机制：
+
+```s
+ldaxr   w1, [x0]
+stxr    w2, w3, [x0]
+```
+
+### Fetch-and-Add
+
+```c
+int FetchAndAdd(int *ptr, int increment)
+{
+    int old = *ptr;
+    *ptr = old + increment;
+    return old;
+}
+```
+
+如果初始值等于 5，A、B 同时执行：FetchAndAdd(&value, 1)。**硬件自动将二者排出先后顺序**，比如 A 返回 5，value 等于 6；B 返回 6，value 等于 7。
+
+### Ticket Lock
+
+借助 FaD 后的排号锁：
+
+```c
+typedef struct {
+    int ticket; // next
+    int turn;   // cur
+} ticket_lock_t;
+
+void ticket_lock_init(ticket_lock_t *lock)
+{
+    lock->ticket = 0;
+    lock->turn = 0;
+}
+void ticket_lock(ticket_lock_t *lock)
+{
+    int my_turn;
+    my_turn = FetchAndAdd(&lock->ticket);
+    while (lock->turn != my_turn) {
+    }
+}
+void ticket_unlock(ticket_lock_t *lock)
+{
+    lock->turn = lock->turn + 1;
+}
+```
+
+Ticket Lock 公平，但依旧归于自旋锁一类。
+
+## 条件变量
+
+条件变量（Condition Variable）让线程在某个条件不符合时**主动睡眠**，在条件符合时被**唤醒**，从而防止轮询造成的 CPU 空转。
+
+比如：
+
+```c
+// Producer
+while (true) {
+    item new_msg = produce_new();
+    lock(&empty_slot_lock);
+    while (empty_slot == 0) {
+        cond_wait(&empty_cond, &empty_slot_lock);
+    }
+    empty_slot--;
+    unlock(&empty_slot_lock);
+    buffer_add(new_msg);
+}
+
+// Consumer
+while (true) {
+    lock(&filled_slot_lock);
+    while (filled_slot == 0) {
+        cond_wait(&filled_cond, &filled_slot_lock);
+    }
+    filled_slot--;
+    unlock(&filled_slot_lock);
+    item msg = buffer_remove();
+    lock(&empty_slot_lock);
+    empty_slot++;
+    cond_signal(&empty_cond);
+    unlock(&empty_slot_lock);
+    handle_item(msg);
+}
+```
+
+注意 `empty_slot` 非条件变量，它可以视作一种**资源**；`empty_cond`：**条件变量**，本质一条 “等待队列+相关操作”；`empty_slot_lock`：资源的锁。
+
+### cond_wait()
+
+```c
+struct cond {
+    struct wait_queue waiters;
+    struct spinlock waiters_lock;
+};
+
+void cond_wait(struct cond *cond, struct lock *mutex)
+{
+    struct thread *current = get_current_thread();
+    // protect the condition variable's wait queue
+    spin_lock(&cond->waiters_lock);
+    wait_queue_push(&cond->waiters, current);
+    mutex_unlock_and_block(
+        mutex,
+        &cond->waiters_lock
+    );
+    lock(mutex);
+}
+
+void mutex_unlock_and_block(struct lock *mutex, struct spinlock *waiters_lock)
+{
+    unlock(mutex);
+    set_current_thread_state(THREAD_BLOCKED);
+    spin_unlock(waiters_lock);
+    schedule();
+}
+```
+
+cond_wait() 将完成三件事：
+
+1. 将当前线程加入条件变量的**等待队列**；
+2. **释放**传入的**互斥锁**，**睡眠**当前线程；
+3. 未来**唤醒**后，**重新**获得该**互斥锁**，最后才从 cond_wait() 返回。
+
+注意 `block_current_and_unlock()` 必须原子地完成 “睡眠和释放锁”。
+
+### cond_signal()
+
+```c
+void cond_signal(struct cond *cond)
+{
+    spin_lock(&cond->waiters_lock);
+    if (!wait_queue_empty(&cond->waiters)) {
+        struct thread *thread;
+        thread = wait_queue_pop(&cond->waiters);
+        wakeup_thread(thread);
+    }
+    spin_unlock(&cond->waiters_lock);
+}
+```
+
+## 信号量
+
+两个原子操作：
+
+- P 操作：等待并消耗一个资源；
+- V 操作：增加一个资源并唤醒等待者。
+
+```c
+struct semaphore {
+    int count;
+    struct wait_queue waiters;
+    struct spinlock lock;
+};
+```
+
+> `count` 表示**剩余的资源量**。
+
+比如：
+
+```c
+struct semaphore empty_slots;
+struct semaphore filled_slots;
+struct lock buffer_lock;
+
+sem_init(&empty_slots, BUFFER_SIZE);
+sem_init(&filled_slots, 0);
+lock_init(&buffer_lock);
+
+// Producer
+while (true) {
+    item new_msg = produce_new();
+    sem_wait(&empty_slots);
+    lock(&buffer_lock);
+    buffer_add(new_msg);
+    unlock(&buffer_lock);
+    sem_signal(&filled_slots);
+}
+
+// Consumer
+while (true) {
+    item msg;
+    sem_wait(&filled_slots);
+    lock(&buffer_lock);
+    msg = buffer_remove();
+    unlock(&buffer_lock);
+    sem_signal(&empty_slots);
+    handle_item(msg);
+}
+```
+
+### 初始化
+
+```c
+void sem_init(struct semaphore *sem, int initial_count)
+{
+    sem->count = initial_count;
+    wait_queue_init(&sem->waiters);
+    spinlock_init(&sem->lock);
+}
+```
+
+### P 操作：sem_wait()
+
+```c
+void sem_wait(struct semaphore *sem)
+{
+    struct thread *current;
+    spin_lock(&sem->lock);
+
+    // a resource is available
+    if (sem->count > 0) {
+        sem->count--;
+        spin_unlock(&sem->lock);
+        return;
+    }
+    // no resource is available
+    current = get_current_thread();
+    wait_queue_push(&sem->waiters, current);
+    block_current_and_unlock(&sem->lock);
+}
+
+void block_current_and_unlock(struct spinlock *lock)
+{
+    struct thread *current;
+    current = get_current_thread();
+    current->state = THREAD_BLOCKED;
+    spin_unlock(lock);
+    schedule();
+}
+```
+
+### V 操作：sem_signal()
+
+```c
+void sem_signal(struct semaphore *sem)
+{
+    struct thread *thread;
+    spin_lock(&sem->lock);
+
+    if (!wait_queue_empty(&sem->waiters)) {
+        thread = wait_queue_pop(&sem->waiters);
+        wakeup_thread(thread);
+        spin_unlock(&sem->lock);
+        return;
+    }
+
+    sem->count++;
+    spin_unlock(&sem->lock);
+}
+```
+
+## RW 锁
+
+```c
+struct rwlock {
+    struct lock lock;
+    struct cond readers_cond;
+    struct cond writers_cond;
+    int active_readers;
+    int waiting_writers;
+    bool writer_active;
+};
+
+struct rwlock *lock;
+char data[SIZE];
+
+void reader(void)
+{
+    lock_reader(lock);
+    read_data(data);
+    unlock_reader(lock);
+}
+void writer(void)
+{
+    lock_writer(lock);
+    update_data(data);
+    unlock_writer(lock);
+}
+```
+
+### 初始化
+
+```c
+void rwlock_init(struct rwlock *rw)
+{
+    lock_init(&rw->lock);
+    cond_init(&rw->readers_cond);
+    cond_init(&rw->writers_cond);
+    rw->active_readers = 0;
+    rw->waiting_writers = 0;
+    rw->writer_active = false;
+}
+```
+
+### R 操作
+
+```c
+void lock_reader(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    // writer-biased rwlock 
+    while (rw->writer_active || rw->waiting_writers > 0) {
+        cond_wait(&rw->readers_cond, &rw->lock);
+    }
+    // reader-biased rwlock
+    while (rw->writer_active) {
+        cond_wait(&rw->readers_cond, &rw->lock);
+    }
+    rw->active_readers++;
+    unlock(&rw->lock);
+}
+
+void unlock_reader(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    rw->active_readers--;
+    if (rw->active_readers == 0) {
+        cond_signal(&rw->writers_cond);
+    }
+    unlock(&rw->lock);
+}
+```
+
+### W 操作
+
+```c
+void lock_writer(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    rw->waiting_writers++;
+    while (rw->writer_active || rw->active_readers > 0) {
+        cond_wait(&rw->writers_cond, &rw->lock);
+    }
+    rw->waiting_writers--;
+    rw->writer_active = true;
+    unlock(&rw->lock);
+}
+
+void unlock_writer(struct rwlock *rw)
+{
+    lock(&rw->lock);
+    rw->writer_active = false;
+    if (rw->waiting_writers > 0) {
+        cond_signal(&rw->writers_cond);
+    } else {
+        cond_broadcast(&rw->readers_cond);
+    }
+    unlock(&rw->lock);
+}
+```
+
+## 死锁
+
+死锁的原因：
+
+1. 互斥访问
+2. 持有并等待
+3. 资源非抢占
+4. 循环等待
+
+# FS
+
+<div align="center">
+  <img src="sjtu.assets/file-system.png"
+  width="50%">
+</div>
+
+## inode
+
+<div align="center">
+  <img src="sjtu.assets/inode.png"
+  width="70%">
+</div>
+
+一个 inode 常记录：
+
+* 文件类型；
+* 文件大小；
+* 所有者 UID 和 GID；
+* 访问权限；
+* 修改、访问时间；
+* **硬链接**计数；
+* 指向文件块的指针。
+
+### 多级 inode
+
+<div align="center">
+  <img src="sjtu.assets/multilevel-inode.png"
+  width="90%">
+</div>
+
+如果 inode 包含：
+
+* 12 个直接指针；
+* 3 个一级间接指针；
+* 1 个二级间接指针；
+
+则单个文件最大：
+
+$$
+(12+3\times512+512\times512)\times4\text{ KiB}=48\text{ KiB}+6\text{ MiB}+1\text{ GiB}
+$$
+
+### 目录
+
+一个**目录文件**包含：
+
+"program" → inode 10
+"paper"   → inode 12
+"notes"   → inode 25
+：
+
+目录文件的一行称作**目录项**，可以将**文件名**解析成 **inode 号**。
+
+### 文件查找
+
+比如查找 `/os-book/fs.tex`：
+
+<div align="center">
+  <img src="sjtu.assets/file-recursive-search.png"
+  width="90%">
+</div>
+
+### Link
+
+目录项 "a.txt" ─┐
+            ├── → inode 42 → 文件
+目录项 "b.txt" ─┘
+
+删除一个文件，仅**删除对应目录项**，并将 inode 的 `link_cnt--`。当 cnt = 0 时才真正释放 inode。
+
+限制：
+
+<div align="center">
+  <img src="sjtu.assets/link-loop.png"
+  width="30%">
+</div>
+
+> * 由于 inode 在不同 FS 中的唯一性，所以不能跨 FS；
+> * 不能 **Link 目录**，防止形成环形目录，除了 `.` 和 `..`；
+
+`Symbolic Link`：一个独立文件，有自己的 inode。
+
+## Fd
+
+<div align="center">
+  <img src="sjtu.assets/fd-table.png"
+  width="100%">
+</div>
+
+> fd：文件描述符，0、1、2 表示**标准输入**、**标准输出**和**标准错误**；所以普通文件的 fd 常从 3 开始。
+
+### 文件游标 File Cursor
+
+游标初始位于文件开头：offset = 0，执行 `write(fd, data, 13)` 成功写入 13B 后，文件游标自动移动到：offset = 13。此时再执行 `read(fd, buffer, 10)` 将从 13B 开始。
+
+lseek() 可以手动修改文件游标，比如：
+
+```c
+int fd = open("file.txt", O_RDWR | O_CREAT, 0664);
+const char *data = "hello, world\n";
+write(fd, data, strlen(data));
+// move the cursor back to the beginning of the file
+lseek(fd, 0, SEEK_SET);
+char buffer[1024] = {0};
+read(fd, buffer, sizeof(buffer));
+printf("%s", buffer);
+```
+
+# Device
+
+## MMIO
+
+<div align="center">
+  <img src="sjtu.assets/mmio.png"
+  width="60%">
+</div>
+
+## IOMMU
+
+<div align="center">
+  <img src="sjtu.assets/iommu.png"
+  width="60%">
+</div>
+
+## GPU
+
+<div align="center">
+  <img src="sjtu.assets/gpu.png"
+  width="90%">
+</div>
